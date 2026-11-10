@@ -126,7 +126,6 @@ def build_command(
     """Build the claude CLI command list."""
     cmd = [
         "claude",
-        "--dangerously-skip-permissions",
         "-p",
         prompt,
         "--output-format",
@@ -135,7 +134,7 @@ def build_command(
         "--model",
         model,
         "--setting-sources",
-        "",
+        os.environ.get("METAHARNESS_CLAUDE_SETTING_SOURCES", ""),
     ]
 
     effective_tools = tools if tools is not None else allowed_tools
@@ -523,7 +522,7 @@ def run(
 ):
     """Run `claude -p` and return parsed SessionResult. Logs to log_dir.
 
-    Uses your Claude Pro/Max subscription (not API key).
+    Inherits endpoint and authentication environment variables from the caller.
 
     Args:
         progress: Show live progress. True = default printer, callable = custom

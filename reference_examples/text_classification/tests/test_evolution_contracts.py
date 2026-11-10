@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import io
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -186,6 +187,42 @@ class HeldOutIsolationTests(unittest.TestCase):
             state = json.loads((run_dir / "finalized.json").read_text())
 
         self.assertEqual(state["status"], "in_progress")
+
+
+class ProposerEnvironmentTests(unittest.TestCase):
+    def test_custom_endpoint_keeps_credentials_and_selects_local_model(self):
+        env = {
+            "ANTHROPIC_BASE_URL": "http://localhost:8000",
+            "ANTHROPIC_AUTH_TOKEN": "test-token",
+            "ANTHROPIC_API_KEY": "test-key",
+            "ANTHROPIC_MODEL": "Qwen3.6-27B",
+            "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "4096",
+        }
+
+        def check_call(**kwargs):
+            self.assertEqual(kwargs["model"], "Qwen3.6-27B")
+            self.assertIsNone(kwargs["effort"])
+            for key, value in env.items():
+                self.assertEqual(os.environ[key], value)
+            return Mock(exit_code=1, stderr="expected test failure")
+
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch.object(meta_harness.claude_wrapper, "run", side_effect=check_call),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertFalse(meta_harness.propose_claude("test", 1))
+
+    def test_subscription_key_is_restored_when_wrapper_raises(self):
+        with (
+            patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}, clear=True),
+            patch.object(
+                meta_harness.claude_wrapper, "run", side_effect=RuntimeError("test")
+            ),
+        ):
+            with self.assertRaises(RuntimeError):
+                meta_harness.propose_claude("test", 1)
+            self.assertEqual(os.environ["ANTHROPIC_API_KEY"], "test-key")
 
 
 if __name__ == "__main__":

@@ -164,22 +164,33 @@ def count_iterations_from_summary():
 def propose_claude(task_prompt, iteration, timeout=2400):
     """Returns True if candidates were produced (pending_eval.json exists)."""
     os.environ.pop("CLAUDECODE", None)
-    # Strip API key so claude CLI uses subscription auth (avoids rate limits)
-    saved_key = os.environ.pop("ANTHROPIC_API_KEY", None)
-    result = claude_wrapper.run(
-        prompt=task_prompt,
-        model="opus",
-        allowed_tools=PROPOSER_ALLOWED_TOOLS,
-        skills=[str(EVOLVE_DIR / ".claude/skills/meta-harness")],
-        cwd=str(EVOLVE_DIR),
-        log_dir=str(LOGS_DIR / "claude_sessions"),
-        name=f"iter{iteration}",
-        timeout_seconds=timeout,
-        effort="max",
+    # Custom endpoints keep their credentials. Preserve subscription auth for
+    # the original Anthropic setup when no endpoint override is configured.
+    custom_endpoint = bool(os.environ.get("ANTHROPIC_BASE_URL"))
+    saved_key = None
+    if not custom_endpoint:
+        saved_key = os.environ.pop("ANTHROPIC_API_KEY", None)
+    model = os.environ.get("METAHARNESS_PROPOSER_MODEL") or os.environ.get(
+        "ANTHROPIC_MODEL", "opus"
     )
-    # Restore API key
-    if saved_key:
-        os.environ["ANTHROPIC_API_KEY"] = saved_key
+    effort = os.environ.get(
+        "METAHARNESS_PROPOSER_EFFORT", "" if custom_endpoint else "max"
+    ) or None
+    try:
+        result = claude_wrapper.run(
+            prompt=task_prompt,
+            model=model,
+            allowed_tools=PROPOSER_ALLOWED_TOOLS,
+            skills=[str(EVOLVE_DIR / ".claude/skills/meta-harness")],
+            cwd=str(EVOLVE_DIR),
+            log_dir=str(LOGS_DIR / "claude_sessions"),
+            name=f"iter{iteration}",
+            timeout_seconds=timeout,
+            effort=effort,
+        )
+    finally:
+        if saved_key is not None:
+            os.environ["ANTHROPIC_API_KEY"] = saved_key
     if result.exit_code != 0:
         print(f"  {_red('proposer failed')} exit={result.exit_code}")
         if result.stderr:
