@@ -624,6 +624,18 @@ def main():
         action="store_true",
         help="Finalize an existing named run with one held-out test evaluation",
     )
+    parser.add_argument("--task-selector", choices=["full", "task-coevolve",
+                        "adaptive-redundancy"], default=None,
+                        help="Optional fixed-worker Symptom2Disease selection experiment")
+    parser.add_argument("--selection-fraction", type=float, default=0.2)
+    parser.add_argument("--redundancy-alpha", type=float, default=1.0)
+    parser.add_argument("--selection-exploration", type=float, default=0.1)
+    parser.add_argument("--redundancy-min-overlap", type=int, default=5)
+    parser.add_argument("--redundancy-shrinkage", type=float, default=5.0)
+    parser.add_argument("--inclusion-draws", type=int, default=4000)
+    parser.add_argument("--selection-estimator", choices=["hajek", "difference"],
+                        default="hajek")
+    parser.add_argument("--evaluation-timeout", type=int, default=7200)
     args = parser.parse_args()
 
     if args.test and not args.run_name:
@@ -633,7 +645,11 @@ def main():
 
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
-    run_evolve(args)
+    if args.task_selector:
+        from adaptive_evolution import run_adaptive_evolution
+        run_adaptive_evolution(args, sys.modules[__name__])
+    else:
+        run_evolve(args)
 
 
 if __name__ == "__main__":

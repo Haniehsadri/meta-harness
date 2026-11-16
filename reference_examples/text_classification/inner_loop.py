@@ -1,5 +1,6 @@
 """Inner Loop: Online and offline training with memory systems."""
 
+import hashlib
 import json
 import threading
 import time
@@ -476,6 +477,19 @@ def evaluate_memory(
     }
 
 
+def select_validation_examples(examples, indices):
+    """Select original split indices without renumbering or silently duplicating."""
+    if indices is None:
+        indices = list(range(len(examples)))
+    if not isinstance(indices, list) or not indices:
+        raise ValueError("Validation indices must be a nonempty JSON list")
+    if any(type(i) is not int or i < 0 or i >= len(examples) for i in indices):
+        raise ValueError("Validation index outside the configured validation pool")
+    if len(set(indices)) != len(indices):
+        raise ValueError("Duplicate validation indices")
+    return [examples[i] for i in indices], indices
+
+
 def load_memory_system(path: str, llm) -> MemorySystem:
     """Load a memory system from a file path.
 
@@ -575,7 +589,15 @@ if __name__ == "__main__":
     )
     parser.add_argument("--log", default=None, help="Path for JSONL training log")
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--val-indices-json", default=None)
+    parser.add_argument("--single-validation-pass", action="store_true",
+                        help="Train without epoch validation, then evaluate once")
+    parser.add_argument("--evaluation-id", default=None)
     args = parser.parse_args()
+    if args.val_indices_json and (not args.val_output or args.test_output):
+        parser.error("--val-indices-json requires val-only evaluation")
+    if args.val_indices_json and not args.single_validation_pass:
+        parser.error("Subset evaluation requires --single-validation-pass")
 
     # Skip if all requested outputs already exist
     outputs_to_check = [p for p in [args.val_output, args.test_output] if p]
@@ -633,6 +655,15 @@ if __name__ == "__main__":
         )
         val_examples = []
         print(f"Train: {len(train_examples)}, Test: {len(test_examples)}", flush=True)
+
+    val_pool_size = len(val_examples)
+    val_indices = list(range(val_pool_size))
+    if eval_val:
+        requested = json.loads(args.val_indices_json) if args.val_indices_json else None
+        val_examples, val_indices = select_validation_examples(val_examples, requested)
+        print(f"Validation selection: {len(val_indices)}/{val_pool_size}, "
+              f"original indices={val_indices}, single_pass={args.single_validation_pass}",
+              flush=True)
 
     from .llm import LLM
 
@@ -706,7 +737,8 @@ if __name__ == "__main__":
                 step_offset=0,
                 mode="offline",
                 num_epochs=args.num_epochs,
-                val_examples=val_examples if val_examples else None,
+                val_examples=(val_examples if val_examples and
+                              not args.single_validation_pass else None),
                 skip_train_eval=not eval_test,
             )
             train_correct = chunk_results["correct"]
@@ -759,6 +791,15 @@ if __name__ == "__main__":
         avg_context_len = result["avg_context_len"]
         test_preds = result["predictions"]
 
+    for original_index, example, prediction in zip(val_indices, val_examples, val_preds):
+        prediction["example_index"] = original_index
+        prediction["example_id"] = hashlib.sha256(
+            json.dumps({"dataset": args.dataset, "split": "val", "seed": args.seed,
+                        "index": original_index, "input": example["input"],
+                        "target": example["target"]},
+                       sort_keys=True).encode()).hexdigest()
+        logger.log("validation_prediction", **prediction)
+
     val_result = make_result(val_preds) if val_preds else None
     test_result = make_result(test_preds) if test_preds else None
 
@@ -794,6 +835,13 @@ if __name__ == "__main__":
     # Build common metadata for output JSON
     def _build_output(result_dict: dict) -> dict:
         return {
+            "evaluation_id": args.evaluation_id,
+            "per_sample": val_preds if result_dict is val_result else test_preds,
+            "validation_pool_size": val_pool_size,
+            "selected_val_indices": val_indices if result_dict is val_result else None,
+            "memory_sha256": (hashlib.sha256(Path(args.save_memory or args.load_memory).read_bytes()).hexdigest()
+                              if args.save_memory or args.load_memory else
+                              hashlib.sha256(memory.get_state().encode()).hexdigest()),
             "accuracy": result_dict["accuracy"],
             "correct": result_dict["correct"],
             "total": result_dict["total"],
@@ -810,16 +858,21 @@ if __name__ == "__main__":
             "llm_input_tokens": llm_usage["input_tokens"],
             "llm_output_tokens": llm_usage["output_tokens"],
             "llm_total_tokens": llm_usage["total_tokens"],
+            "estimated_cost_usd": llm_usage.get("estimated_cost_usd"),
         }
 
     if args.val_output and val_result:
         Path(args.val_output).parent.mkdir(parents=True, exist_ok=True)
-        with open(args.val_output, "w") as f:
-            json.dump(_build_output(val_result), f, indent=2)
+        output_path = Path(args.val_output)
+        temporary = output_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(_build_output(val_result), indent=2), encoding="utf-8")
+        temporary.replace(output_path)
         print(f"Saved val results to {args.val_output}", flush=True)
 
     if args.test_output and test_result:
         Path(args.test_output).parent.mkdir(parents=True, exist_ok=True)
-        with open(args.test_output, "w") as f:
-            json.dump(_build_output(test_result), f, indent=2)
+        output_path = Path(args.test_output)
+        temporary = output_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(_build_output(test_result), indent=2), encoding="utf-8")
+        temporary.replace(output_path)
         print(f"Saved test results to {args.test_output}", flush=True)
