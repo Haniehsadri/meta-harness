@@ -134,15 +134,64 @@ def run_benchmark(args):
 
 
 def render_task_prompt(iteration, num_datasets):
-    """Build the prompt for the proposer Claude session."""
+    """Give the proposer bounded history and exact paths before it uses tools."""
+    history = []
+    if EVOLUTION_SUMMARY.exists():
+        for line in EVOLUTION_SUMMARY.read_text(encoding="utf-8").splitlines():
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(row, dict):
+                continue
+            history.append({
+                key: (value[:180] if isinstance(value, str) else value)
+                for key in ("iteration", "system", "avg_val", "outcome", "axis")
+                if (value := row.get(key)) is not None
+            })
+    frontier = {}
+    if FRONTIER_VAL.exists():
+        try:
+            raw = json.loads(FRONTIER_VAL.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                for dataset, entry in raw.items():
+                    if not dataset.startswith("_") and isinstance(entry, dict):
+                        frontier[dataset] = {
+                            k: v for k, v in entry.items()
+                            if k in ("best_system", "val_accuracy", "accuracy", "ctx_len")
+                        }
+                frontier["_pareto"] = raw.get("_pareto", [])[:3]
+        except (json.JSONDecodeError, TypeError):
+            frontier = {"note": "Read the frontier file if needed; compact view unavailable."}
     return (
-        f"Run iteration {iteration} of the evolution loop. There are {num_datasets} datasets.\n\n"
-        f"## Run directories\n"
-        f"All logs and results for this run are under `{LOGS_DIR}/`.\n"
-        f"- `{EVOLUTION_SUMMARY}` — past results\n"
-        f"- `{FRONTIER_VAL}` — frontier\n"
-        f"- `{LOGS_DIR / 'reports'}/` — post-eval reports\n"
-        f"- Write pending_eval.json to: `{PENDING_EVAL}`"
+        f"Run iteration {iteration}; {num_datasets} dataset(s). Deliver exactly three "
+        "checked NEW agents and the manifest, then exit. Do not run benchmarks.\n\n"
+        "## Exact paths (do not search for alternatives)\n"
+        f"Project/work directory: {EVOLVE_DIR}\n"
+        f"Configuration: {EVOLVE_DIR / 'config.yaml'}\n"
+        f"Interface: {EVOLVE_DIR / 'memory_system.py'}\n"
+        f"Proven baseline implementation: {EVOLVE_DIR / 'agents/fewshot_memory.py'}\n"
+        f"New agents directory: {EVOLVE_DIR / 'agents'}\n"
+        f"Run logs: {LOGS_DIR}\n"
+        f"History: {EVOLUTION_SUMMARY}\n"
+        f"Frontier: {FRONTIER_VAL}\n"
+        f"Optional reports: {LOGS_DIR / 'reports'}\n"
+        f"Write pending_eval.json to: {PENDING_EVAL}\n"
+        f"Active Python interpreter: {sys.executable}\n"
+        f"Package root for PYTHONPATH: {EVOLVE_DIR.parent}\n"
+        "For stub checks use this interpreter with that PYTHONPATH and imports from "
+        "text_classification.agents.<name>. Do not invoke a fresh uv environment.\n\n"
+        "## Compact validation history\n"
+        f"Frontier: {json.dumps(frontier, ensure_ascii=False)}\n"
+        f"Last 12 candidates: {json.dumps(history[-12:], ensure_ascii=False)}\n"
+        "Use scores/outcomes, not the historical delta field, which may use an updated frontier. "
+        "A failed outcome is an execution failure, not measured zero accuracy.\n\n"
+        "## Completion plan\n"
+        "Keep initial inspection to about six tool calls; target at most 30 total. "
+        "Reuse one proven base, make three small mechanism changes, run stub-only "
+        "multi-batch/state-restore checks, and submit. No raw log dumps, model-backed "
+        "prototypes, benchmark runs, or 2-3 variant sweeps. Save each checked candidate "
+        "in the manifest immediately; finish all three before ending.\n"
     )
 
 
