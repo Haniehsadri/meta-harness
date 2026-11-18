@@ -1,4 +1,4 @@
-"""Auditable, resumable fixed-worker S2D evolution, opt-in via --task-selector."""
+"""Auditable, resumable fixed-worker classification evolution, opt-in via --task-selector."""
 
 import json
 import math
@@ -68,8 +68,23 @@ def protected_files(code, baselines):
 
 
 def validate_settings(args, cfg):
-    if cfg["datasets"] != ["Symptom2Disease"]:
-        raise ValueError("Stage 1 requires datasets: [Symptom2Disease]")
+    from runpy import run_path
+    registry = run_path(str(Path(__file__).parent / "data" / "constants.py"))
+    datasets = cfg.get("datasets")
+    if not isinstance(datasets, list) or not datasets or any(
+            not isinstance(d, str) or d not in registry["ALL_TASKS"] for d in datasets):
+        raise ValueError("datasets must be a nonempty list of supported classification tasks")
+    if len(set(datasets)) != len(datasets):
+        raise ValueError("datasets must not contain duplicates")
+    for dataset in datasets:
+        sizes = split_sizes(cfg, dataset)
+        if any(type(v) is not int or v <= 0 for v in sizes.values()) or sizes["num_val"] < 2:
+            raise ValueError(f"{dataset}: split sizes must be positive integers; num_val >= 2")
+        official = registry["MCE_DATA_SPLITS"].get(dataset)
+        if official and any(sizes["num_" + split] > limit for split, limit in official.items()):
+            raise ValueError(f"{dataset}: requested sizes {sizes} exceed official splits {official}")
+    if not cfg["memory_systems"]["baselines"]:
+        raise ValueError("Adaptive selection requires at least one full-validation baseline")
     if len(cfg["benchmark"]["seeds"]) != 1:
         raise ValueError("Stage 1 uses one fixed evaluation seed")
     if cfg["inner_loop"].get("mode") != "offline" or cfg["inner_loop"].get("num_epochs") != 1:
@@ -106,11 +121,11 @@ def outcome_map(result):
     return {row["example_index"]: float(row["was_correct"]) for row in rows}
 
 
-def candidate_history(state):
+def candidate_history(state, dataset="Symptom2Disease"):
     # Repeated measurements of identical source count as one harness version.
     grouped = {}
     for row in state["records"]:
-        if row["status"] != "complete":
+        if row["status"] != "complete" or row.get("dataset", "Symptom2Disease") != dataset:
             continue
         by_index = grouped.setdefault(row["source_hash"], {})
         for index, value in row["outcomes"].items():
@@ -125,41 +140,103 @@ def verify_candidate_sources(code, records):
             raise ValueError(f"Previously evaluated candidate changed: {record['name']}")
 
 
+def split_sizes(cfg, dataset):
+    """Use the same default + per-dataset override precedence as benchmark.py."""
+    return {**{k: cfg["dataset"][k] for k in ("num_train", "num_val", "num_test")},
+            **{k: v for k, v in cfg["dataset"].get("overrides", {}).get(dataset, {}).items()
+               if k in ("num_train", "num_val", "num_test")}}
+
+
+def record_dataset(record):
+    # Old S2D records did not carry this explicit field.
+    return record.get("dataset", "Symptom2Disease")
+
+
+def completed_record(state, candidate_id, dataset):
+    return next((r for r in state["records"] if r["candidate_id"] == candidate_id
+                 and record_dataset(r) == dataset and r["status"] == "complete"), None)
+
+
+def aggregate_records(state):
+    """Rank a harness only after all configured datasets have committed evidence."""
+    datasets = state["manifest"]["config"]["datasets"]
+    grouped = {}
+    for record in state["records"]:
+        if record["status"] == "complete":
+            grouped.setdefault(record["candidate_id"], {})[record_dataset(record)] = record
+    result = []
+    for records in grouped.values():
+        if not all(d in records for d in datasets):
+            continue
+        first = records[datasets[0]]
+        scores = [records[d]["score"] for d in datasets]
+        score = {
+            "subset_accuracy": sum(s["subset_accuracy"] for s in scores) / len(scores),
+            "estimated_accuracy": sum(s["estimated_accuracy"] for s in scores) / len(scores),
+            # Approximation assuming independent sampling across dataset pools.
+            "approximate_se": math.sqrt(sum(s["approximate_se"] ** 2 for s in scores)) / len(scores),
+            "measured_full": all(s["measured_full"] for s in scores),
+        }
+        result.append({**first, "score": score, "dataset_records": records})
+    return result
+
+
 def write_frontier(root, state):
-    complete = [r for r in state["records"] if r["status"] == "complete"]
+    complete = aggregate_records(state)
     if not complete:
         return
+    datasets = state["manifest"]["config"]["datasets"]
     best = max(complete, key=lambda r: r["score"]["estimated_accuracy"])
-    value = 100 * best["score"]["estimated_accuracy"]
-    save_json(root / "frontier_val.json", {
-        "Symptom2Disease": {"best_system": best["name"], "accuracy": value,
-                            "score_kind": "estimated_full_pool"},
-        "_pareto": [{"system": best["name"], "val_accuracy": value}],
-        "_selection_estimator": state["manifest"]["estimator"],
-    })
+    frontier = {}
+    for dataset in datasets:
+        leader = max(complete, key=lambda r: r["dataset_records"][dataset]["score"]["estimated_accuracy"])
+        score = leader["dataset_records"][dataset]["score"]
+        frontier[dataset] = {"best_system": leader["name"],
+                             "accuracy": 100 * score["estimated_accuracy"],
+                             "score_kind": "measured_full_pool" if score["measured_full"] else "estimated_full_pool"}
+    frontier.update({"_pareto": [{"system": best["name"],
+                                 "val_accuracy": 100 * best["score"]["estimated_accuracy"]}],
+                     "_selection_estimator": state["manifest"]["estimator"],
+                     "_aggregation": "unweighted_mean_across_datasets"})
+    save_json(root / "frontier_val.json", frontier)
     rows = [{"iteration": r["iteration"], "system": r["name"],
              "candidate_id": r["candidate_id"], "status": r["status"],
-             "hypothesis": r.get("hypothesis", ""), **r.get("score", {}),
-             "avg_val": 100 * r["score"]["subset_accuracy"] if r.get("score") else None,
-             "est_full_val": 100 * r["score"]["estimated_accuracy"] if r.get("score") else None,
-             "est_full_se": 100 * r["score"]["approximate_se"] if r.get("score") else None}
-            for r in state["records"] if r["iteration"] > 0]
+             "hypothesis": r.get("hypothesis", ""), **r["score"],
+             "avg_val": 100 * r["score"]["subset_accuracy"],
+             "est_full_val": 100 * r["score"]["estimated_accuracy"],
+             "est_full_se": 100 * r["score"]["approximate_se"],
+             "per_dataset": {d: {**record["score"], "selected_count": len(record["outcomes"]),
+                                  "memory": record["memory"]}
+                             for d, record in r["dataset_records"].items()}}
+            for r in complete if r["iteration"] > 0]
     temporary = root / "evolution_summary.tmp"
     temporary.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
     temporary.replace(root / "evolution_summary.jsonl")
 
 
-def evaluate(root, code, cfg, args, name, indices, phase, candidate_id, load_memory=None):
+def evaluate_dataset(root, code, cfg, args, name, indices, phase, candidate_id,
+                     dataset, load_memory=None):
+    # Preserve old single-S2D paths and evaluator call compatibility.
+    kwargs = {} if cfg["datasets"] == ["Symptom2Disease"] else {"dataset": dataset}
+    return evaluate(root, code, cfg, args, name, indices, phase, candidate_id,
+                    load_memory=load_memory, **kwargs)
+
+def evaluate(root, code, cfg, args, name, indices, phase, candidate_id, load_memory=None, dataset=None):
     model = cfg["models"][0]
-    sizes = {**{k: cfg["dataset"][k] for k in ("num_train", "num_val", "num_test")},
-             **cfg["dataset"].get("overrides", {}).get("Symptom2Disease", {})}
+    dataset = dataset or cfg["datasets"][0]
+    sizes = split_sizes(cfg, dataset)
     seed = cfg["benchmark"]["seeds"][0]
     identity = {"candidate_id": candidate_id, "indices": indices, "phase": phase,
                 "config": cfg, "pool": pool_fingerprint(code)}
+    if cfg["datasets"] != ["Symptom2Disease"]:
+        identity["dataset"] = dataset
     if load_memory:
         identity["memory_hash"] = file_hash(load_memory)
     evaluation_id = digest(identity)
-    directory = root / "evaluations" / phase / name
+    directory = root / "evaluations" / phase
+    if cfg["datasets"] != ["Symptom2Disease"]:
+        directory /= dataset
+    directory /= name
     directory.mkdir(parents=True, exist_ok=True)
     output = directory / ("test.json" if phase == "test" else "val.json")
     memory = load_memory or directory / "memory.json"
@@ -169,10 +246,10 @@ def evaluate(root, code, cfg, args, name, indices, phase, candidate_id, load_mem
             raise ValueError(f"Incompatible cached result: {output}")
         if result.get("memory_sha256") != file_hash(memory):
             raise ValueError(f"Memory changed since evaluation: {memory}")
-        event(root, "evaluation_cached", name=name, phase=phase, result=str(output))
+        event(root, "evaluation_cached", name=name, dataset=dataset, phase=phase, result=str(output))
         return result, memory
     command = [sys.executable, "-m", "text_classification.inner_loop", "--memory", name,
-               "--dataset", "Symptom2Disease", "--model", model["model"],
+               "--dataset", dataset, "--model", model["model"],
                "--seed", str(seed), "--mode", "offline", "--num-epochs", "1",
                "--single-validation-pass", "--evaluation-id", evaluation_id,
                "--log", str(directory / "trace.jsonl"), "--force"]
@@ -195,7 +272,7 @@ def evaluate(root, code, cfg, args, name, indices, phase, candidate_id, load_mem
     env["PYTHONUNBUFFERED"] = "1"
     attempt = len(list(directory.glob("attempt-*.log"))) + 1
     log = directory / f"attempt-{attempt:03d}.log"
-    event(root, "evaluation_started", name=name, phase=phase, selected=indices,
+    event(root, "evaluation_started", name=name, dataset=dataset, phase=phase, selected=indices,
           evaluation_id=evaluation_id, attempt=attempt, log=str(log),
           memory_reused=bool(load_memory))
     started = time.monotonic()
@@ -208,14 +285,16 @@ def evaluate(root, code, cfg, args, name, indices, phase, candidate_id, load_mem
         if process.returncode != 0:
             raise RuntimeError(f"Evaluation exit {process.returncode}; see {log}")
     except (subprocess.TimeoutExpired, RuntimeError) as error:
-        event(root, "evaluation_failed", name=name, phase=phase, status="execution_error",
+        event(root, "evaluation_failed", name=name, dataset=dataset, phase=phase, status="execution_error",
               elapsed_seconds=time.monotonic() - started, error=str(error), log=str(log))
         raise
     result = read_json(output)
+    if result.get("dataset") != dataset:
+        raise ValueError(f"Result dataset mismatch: {output}")
     if result.get("evaluation_id") != evaluation_id or result.get("total") != (
             sizes["num_test"] if phase == "test" else len(indices)):
         raise ValueError(f"Incomplete or mismatched evaluation: {output}")
-    event(root, "evaluation_completed", name=name, phase=phase,
+    event(root, "evaluation_completed", name=name, dataset=dataset, phase=phase,
           elapsed_seconds=time.monotonic() - started, accuracy=result["accuracy"],
           examples=result["total"], llm_calls=result.get("llm_calls"),
           input_tokens=result.get("llm_input_tokens"), output_tokens=result.get("llm_output_tokens"),
@@ -272,31 +351,33 @@ def run_adaptive_evolution(args, harness):
             raise ValueError("Evaluation snapshot has changed")
         state["protected"] = protected
         save_json(state_path, state)
-        size = cfg["dataset"].get("overrides", {}).get("Symptom2Disease", {}).get(
-            "num_val", cfg["dataset"]["num_val"])
-        if not 2 <= size <= 50:
-            raise ValueError("S2D validation pool size must be between 2 and 50")
-        full_indices = list(range(size))
+        datasets = cfg["datasets"]
+        pools = {dataset: split_sizes(cfg, dataset)["num_val"] for dataset in datasets}
         event(root, "run_started", resumed=bool(state["records"]), settings=settings,
-              validation_pool=size, estimator=args.selection_estimator, snapshot=str(code))
+              datasets=datasets, validation_pools=pools,
+              validation_pool=pools[datasets[0]] if len(datasets) == 1 else None,
+              aggregation="unweighted_mean_across_datasets",
+              estimator=args.selection_estimator, snapshot=str(code))
 
         for name in baselines:
-            if any(r["name"] == name for r in state["records"]):
-                continue
             source_hash = file_hash(code / "agents" / f"{name}.py")
             candidate_id = f"baseline:{name}:{source_hash}"
-            result, memory = evaluate(root, code, cfg, args, name, full_indices,
-                                      "baseline", candidate_id)
-            outcomes = outcome_map(result)
-            if set(outcomes) != set(full_indices):
-                raise ValueError("Initialization requires complete validation evidence")
-            state["records"].append({"candidate_id": candidate_id, "name": name,
-                "source_hash": source_hash, "iteration": 0, "status": "complete",
-                "outcomes": outcomes, "memory": str(memory),
-                "score": {"subset_accuracy": result["accuracy"],
-                          "estimated_accuracy": result["accuracy"], "approximate_se": 0.0,
-                          "measured_full": True}})
-            save_json(state_path, state)
+            for dataset in datasets:
+                if completed_record(state, candidate_id, dataset):
+                    continue
+                full_indices = list(range(pools[dataset]))
+                result, memory = evaluate_dataset(root, code, cfg, args, name, full_indices,
+                                                 "baseline", candidate_id, dataset)
+                outcomes = outcome_map(result)
+                if set(outcomes) != set(full_indices):
+                    raise ValueError(f"{dataset}: initialization requires complete validation evidence")
+                state["records"].append({"candidate_id": candidate_id, "name": name,
+                    "dataset": dataset, "source_hash": source_hash, "iteration": 0,
+                    "status": "complete", "outcomes": outcomes, "memory": str(memory),
+                    "score": {"subset_accuracy": result["accuracy"],
+                              "estimated_accuracy": result["accuracy"], "approximate_se": 0.0,
+                              "measured_full": True}})
+                save_json(state_path, state)
         verify_candidate_sources(code, state["records"])
         write_frontier(root, state)
 
@@ -321,9 +402,10 @@ def run_adaptive_evolution(args, harness):
             if not proposal_path.exists():
                 harness.PENDING_EVAL.unlink(missing_ok=True)
                 event(root, "proposal_started", iteration=iteration)
-                prompt = harness.render_task_prompt(iteration, 1) + (
+                prompt = harness.render_task_prompt(iteration, len(datasets)) + (
                     "\nValidation uses sampled examples. Compare candidates with est_full_val, "
-                    "not raw subset accuracy. Only edit NEW agents/<name>.py files. "
+                    "not raw subset accuracy. Each dataset has its own pool/history; overall scores "
+                    "are unweighted dataset means. Only edit NEW agents/<name>.py files. "
                     "Evaluator/config/data and existing candidates must remain unchanged.")
                 if not harness.propose_claude(prompt, iteration, timeout=args.propose_timeout):
                     event(root, "proposal_failed", iteration=iteration)
@@ -349,62 +431,77 @@ def run_adaptive_evolution(args, harness):
                 event(root, "proposal_completed", iteration=iteration, candidates=names)
             for candidate in read_json(proposal_path)["candidates"]:
                 name, candidate_id = candidate["name"], candidate["candidate_id"]
-                if any(r["candidate_id"] == candidate_id for r in state["records"]):
-                    continue
                 if harness._interrupted:
                     return
                 if protected_files(code, state["protected_agents"]) != protected:
                     raise ValueError("Evaluation snapshot was modified")
                 if file_hash(code / "agents" / f"{name}.py") != candidate["source_hash"]:
                     raise ValueError(f"Candidate source changed: {name}")
-                plan_path = root / "selections" / f"{iteration:04d}-{name}.json"
-                history = candidate_history(state)
-                if plan_path.exists():
-                    plan = read_json(plan_path)
-                    if plan["history_hash"] != digest(history):
-                        raise ValueError("Saved plan history differs from committed history")
-                else:
-                    event(root, "selection_started", iteration=iteration, name=name,
-                          history_hash=digest(history), history_candidates=len(history),
-                          monte_carlo_draws=settings["probability_draws"])
-                    selection_started = time.monotonic()
-                    plan = make_plan(history, size, candidate_id, settings)
-                    plan["selection_seconds"] = time.monotonic() - selection_started
-                    save_json(plan_path, plan)
-                if settings["policy"] == "adaptive-redundancy" and settings["alpha"] > 0:
-                    if plan["coverage"]["positive_pairs"] == 0:
-                        event(root, "no_supported_positive_relationships", name=name,
-                              min_overlap=settings["min_overlap"], coverage=plan["coverage"],
-                              message="No redundancy penalty is active for this candidate")
-                if plan["zero_mc_hits"]:
-                    event(root, "inclusion_probability_warning", name=name,
+                for dataset in datasets:
+                    if completed_record(state, candidate_id, dataset):
+                        continue
+                    if harness._interrupted:
+                        return
+                    plan_directory = root / "selections"
+                    if datasets != ["Symptom2Disease"]:
+                        plan_directory /= dataset
+                    plan_path = plan_directory / f"{iteration:04d}-{name}.json"
+                    history = candidate_history(state, dataset)
+                    if plan_path.exists():
+                        plan = read_json(plan_path)
+                        if plan["history_hash"] != digest(history):
+                            raise ValueError("Saved plan history differs from committed history")
+                    else:
+                        event(root, "selection_started", iteration=iteration, name=name, dataset=dataset,
+                              history_hash=digest(history), history_candidates=len(history),
+                              monte_carlo_draws=settings["probability_draws"])
+                        selection_started = time.monotonic()
+                        # Namespace RNG streams across datasets; preserve single-S2D draws.
+                        selection_id = candidate_id if datasets == ["Symptom2Disease"] else f"{dataset}:{candidate_id}"
+                        plan = make_plan(history, pools[dataset], selection_id, settings)
+                        plan["dataset"] = dataset
+                        plan["selection_seconds"] = time.monotonic() - selection_started
+                        save_json(plan_path, plan)
+                    if plan.get("dataset", "Symptom2Disease") != dataset:
+                        raise ValueError("Saved selection plan belongs to another dataset")
+                    if settings["policy"] == "adaptive-redundancy" and settings["alpha"] > 0:
+                        if plan["coverage"]["positive_pairs"] == 0:
+                            event(root, "no_supported_positive_relationships", name=name, dataset=dataset,
+                                  min_overlap=settings["min_overlap"], coverage=plan["coverage"],
+                                  message="No redundancy penalty is active for this candidate")
+                    if plan["zero_mc_hits"]:
+                        event(root, "inclusion_probability_warning", name=name, dataset=dataset,
+                              zero_mc_hits=plan["zero_mc_hits"],
+                              message="Some inclusion probabilities used a Monte Carlo floor")
+                    event(root, "selection_frozen", iteration=iteration, name=name, dataset=dataset,
+                          validation_pool=pools[dataset], selection_seconds=plan.get("selection_seconds"),
+                          selected=plan["selected"], selected_count=len(plan["selected"]),
+                          history_candidates=plan["history_candidates"], coverage=plan["coverage"],
+                          penalized_steps=plan["penalized_steps"],
+                          selection_changed_vs_alpha_zero=plan["selection_changed_vs_alpha_zero"],
                           zero_mc_hits=plan["zero_mc_hits"],
-                          message="Some inclusion probabilities used a Monte Carlo floor")
-                event(root, "selection_frozen", iteration=iteration, name=name,
-                      selection_seconds=plan.get("selection_seconds"),
-                      selected=plan["selected"], selected_count=len(plan["selected"]),
-                      history_candidates=plan["history_candidates"], coverage=plan["coverage"],
-                      penalized_steps=plan["penalized_steps"],
-                      selection_changed_vs_alpha_zero=plan["selection_changed_vs_alpha_zero"],
-                      zero_mc_hits=plan["zero_mc_hits"],
-                      min_inclusion_probability=plan["min_inclusion_probability"],
-                      max_inclusion_mc_se=plan["max_inclusion_mc_se"], plan=str(plan_path))
-                result, memory = evaluate(root, code, cfg, args, name, plan["selected"],
-                                          "search", candidate_id)
-                if protected_files(code, state["protected_agents"]) != protected:
-                    raise ValueError("Candidate modified protected evaluation files")
-                verify_candidate_sources(code, state["records"])
-                if file_hash(code / "agents" / f"{name}.py") != candidate["source_hash"]:
-                    raise ValueError("Candidate source changed during execution")
-                outcomes = outcome_map(result)
-                score = estimate(outcomes, plan, args.selection_estimator)
-                state["records"].append({**candidate, "iteration": iteration,
-                    "status": "complete", "outcomes": outcomes, "score": score,
-                    "memory": str(memory), "selection_plan": str(plan_path)})
-                save_json(state_path, state)
-                write_frontier(root, state)
-                event(root, "history_updated", name=name, score=score,
-                      candidates=len(state["records"]))
+                          min_inclusion_probability=plan["min_inclusion_probability"],
+                          max_inclusion_mc_se=plan["max_inclusion_mc_se"], plan=str(plan_path))
+                    result, memory = evaluate_dataset(root, code, cfg, args, name, plan["selected"],
+                                                     "search", candidate_id, dataset)
+                    if protected_files(code, state["protected_agents"]) != protected:
+                        raise ValueError("Candidate modified protected evaluation files")
+                    verify_candidate_sources(code, state["records"])
+                    if file_hash(code / "agents" / f"{name}.py") != candidate["source_hash"]:
+                        raise ValueError("Candidate source changed during execution")
+                    outcomes = outcome_map(result)
+                    score = estimate(outcomes, plan, args.selection_estimator)
+                    state["records"].append({**candidate, "iteration": iteration, "dataset": dataset,
+                        "status": "complete", "outcomes": outcomes, "score": score,
+                        "memory": str(memory), "selection_plan": str(plan_path)})
+                    save_json(state_path, state)
+                    write_frontier(root, state)
+                    event(root, "history_updated", name=name, dataset=dataset, score=score,
+                          candidates=len(candidate_history(state, dataset)))
+                aggregate = next(r for r in aggregate_records(state) if r["candidate_id"] == candidate_id)
+                event(root, "candidate_completed", name=name, datasets=datasets,
+                      score=aggregate["score"],
+                      per_dataset={d: r["score"] for d, r in aggregate["dataset_records"].items()})
             state["completed_iteration"] = iteration
             state["active_iteration"] = None
             save_json(state_path, state)
@@ -418,33 +515,47 @@ def finalize(root, code, cfg, args, state):
     if marker.exists() and read_json(marker).get("status") == "complete":
         print(json.dumps(read_json(marker), indent=2))
         return
-    # All policies use the same declared top-three full-validation confirmation.
+    datasets = cfg["datasets"]
+    ranked = sorted(aggregate_records(state), key=lambda r: -r["score"]["estimated_accuracy"])
+    if not ranked:
+        raise ValueError("No harness has complete results on all configured datasets")
     if not marker.exists():
-        ranked = sorted(state["records"], key=lambda r: -r["score"]["estimated_accuracy"])
-        save_json(marker, {"status": "confirming", "shortlist": [r["name"] for r in ranked[:3]]})
+        save_json(marker, {"status": "confirming", "datasets": datasets,
+                           "shortlist": [r["name"] for r in ranked[:3]]})
     final = read_json(marker)
-    records = {r["name"]: r for r in state["records"]}
-    confirmations = []
-    size = cfg["dataset"].get("overrides", {}).get("Symptom2Disease", {}).get(
-        "num_val", cfg["dataset"]["num_val"])
+    records = {r["name"]: r for r in ranked}
+    confirmations, per_dataset = [], {}
     for name in final["shortlist"]:
-        record = records[name]
-        if file_hash(code / "agents" / f"{name}.py") != record["source_hash"]:
-            raise ValueError(f"Candidate source changed before confirmation: {name}")
-        # A full-pool result already measures the confirmation objective.
-        if record["score"]["measured_full"]:
-            confirmations.append((name, record["score"]["estimated_accuracy"]))
-        else:
-            result, _ = evaluate(root, code, cfg, args, name, list(range(size)),
-                                 "confirmation", record["candidate_id"], Path(record["memory"]))
-            confirmations.append((name, result["accuracy"]))
+        candidate = records[name]
+        per_dataset[name] = {}
+        for dataset in datasets:
+            record = candidate["dataset_records"][dataset]
+            if file_hash(code / "agents" / f"{name}.py") != record["source_hash"]:
+                raise ValueError(f"Candidate source changed before confirmation: {name}")
+            if record["score"]["measured_full"]:
+                accuracy = record["score"]["estimated_accuracy"]
+                event(root, "confirmation_reused", name=name, dataset=dataset, accuracy=accuracy)
+            else:
+                size = split_sizes(cfg, dataset)["num_val"]
+                result, _ = evaluate_dataset(root, code, cfg, args, name, list(range(size)),
+                    "confirmation", record["candidate_id"], dataset, Path(record["memory"]))
+                accuracy = result["accuracy"]
+            per_dataset[name][dataset] = accuracy
+        confirmations.append((name, sum(per_dataset[name].values()) / len(datasets)))
     winner, accuracy = max(confirmations, key=lambda pair: pair[1])
     event(root, "winner_selected", winner=winner, full_validation_accuracy=accuracy,
-          confirmations=confirmations)
-    record = records[winner]
-    result, _ = evaluate(root, code, cfg, args, winner, [], "test", record["candidate_id"],
-                         Path(record["memory"]))
+          confirmations=confirmations, per_dataset=per_dataset,
+          aggregation="unweighted_mean_across_datasets")
+    tests = {}
+    for dataset in datasets:
+        record = records[winner]["dataset_records"][dataset]
+        result, _ = evaluate_dataset(root, code, cfg, args, winner, [], "test",
+            record["candidate_id"], dataset, Path(record["memory"]))
+        tests[dataset] = {"accuracy": result["accuracy"], "examples": result["total"]}
     final.update(status="complete", winner=winner, confirmation_scores=confirmations,
-                 test_accuracy=result["accuracy"], test_examples=result["total"])
+                 confirmation_per_dataset=per_dataset, test_per_dataset=tests,
+                 aggregation="unweighted_mean_across_datasets",
+                 test_accuracy=sum(r["accuracy"] for r in tests.values()) / len(datasets),
+                 test_examples=sum(r["examples"] for r in tests.values()))
     save_json(marker, final)
     event(root, "finalization_completed", **final)

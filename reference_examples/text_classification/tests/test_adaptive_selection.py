@@ -215,6 +215,15 @@ class EvolutionIntegrationTests(unittest.TestCase):
 
 class CommandLinePipelineTests(unittest.TestCase):
     def test_cli_runs_real_evaluator_subprocesses_with_fake_models(self):
+        self._run_cli(["Symptom2Disease"])
+
+    def test_cli_runs_single_lawbench(self):
+        self._run_cli(["LawBench"])
+
+    def test_cli_runs_multiple_datasets_with_separate_memories(self):
+        self._run_cli(["Symptom2Disease", "LawBench", "USPTO"])
+
+    def _run_cli(self, datasets):
         source = Path(__file__).parents[1]
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory) / "text_classification"
@@ -222,13 +231,15 @@ class CommandLinePipelineTests(unittest.TestCase):
                 "logs", "results", ".venv", "__pycache__", "tests"))
             config_path = project / "config.yaml"
             cfg = yaml.safe_load(config_path.read_text(encoding="utf-8-sig"))
-            cfg["datasets"] = ["Symptom2Disease"]
+            cfg["datasets"] = datasets
             cfg["models"] = [{"model": "fake"}]
             cfg["benchmark"]["seeds"] = [42]
             cfg["inner_loop"]["mode"] = "offline"
             cfg["inner_loop"]["num_epochs"] = 1
-            cfg["dataset"]["overrides"]["Symptom2Disease"] = {
-                "num_train": 4, "num_val": 10, "num_test": 4}
+            pool_sizes = {d: 10 if d == "Symptom2Disease" else 6 if d == "LawBench" else 8 for d in datasets}
+            for dataset in datasets:
+                cfg["dataset"]["overrides"][dataset] = {
+                    "num_train": 4, "num_val": pool_sizes[dataset], "num_test": 4}
             config_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
             (project / "llm.py").write_text(
                 "from typing import Callable\n"
@@ -267,18 +278,29 @@ class CommandLinePipelineTests(unittest.TestCase):
             self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
             root = project / "logs" / "cli"
             results = list((root / "evaluations" / "search").rglob("val.json"))
-            self.assertEqual(len(results), 1)
-            result = evolution.read_json(results[0])
-            self.assertEqual(result["total"], 2)
-            self.assertEqual(result["llm_calls"], 2)
-            self.assertEqual(len(result["per_sample"]), 2)
+            self.assertEqual(len(results), len(datasets))
+            identities = []
+            for path in results:
+                result = evolution.read_json(path)
+                dataset = result["dataset"]
+                count = max(1, int(pool_sizes[dataset] * 0.2))
+                self.assertEqual(result["total"], count)
+                self.assertEqual(result["llm_calls"], count)
+                self.assertEqual(result["validation_pool_size"], pool_sizes[dataset])
+                self.assertEqual(len(result["per_sample"]), count)
+                identities.append(result["evaluation_id"])
+                self.assertTrue((path.parent / "memory.json").exists())
+            self.assertEqual(len(set(identities)), len(datasets))
+            records = evolution.read_json(root / "state.json")["records"]
+            self.assertEqual(len(records), 3 * len(datasets))
             self.assertTrue((root / "iteration-0001.json").exists())
             process = subprocess.run(command + ["--test"], env=env, cwd=project,
                                      capture_output=True, text=True, timeout=120)
             self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
             final = evolution.read_json(root / "finalized.json")
             self.assertEqual(final["status"], "complete")
-            self.assertEqual(final["test_examples"], 4)
+            self.assertEqual(final["test_examples"], 4 * len(datasets))
+            self.assertEqual(set(final["test_per_dataset"]), set(datasets))
 
 
 if __name__ == "__main__":

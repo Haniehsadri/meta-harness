@@ -626,7 +626,7 @@ def main():
     )
     parser.add_argument("--task-selector", choices=["full", "task-coevolve",
                         "adaptive-redundancy"], default=None,
-                        help="Optional fixed-worker Symptom2Disease selection experiment")
+                        help="Optional fixed-worker selection on the configured classification datasets")
     parser.add_argument("--selection-fraction", type=float, default=0.2)
     parser.add_argument("--redundancy-alpha", type=float, default=1.0)
     parser.add_argument("--selection-exploration", type=float, default=0.1)

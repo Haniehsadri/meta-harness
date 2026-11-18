@@ -1,8 +1,9 @@
-﻿# Adaptive S2D task selection
+# Adaptive classification task selection
 
 This optional experiment adds the selector from `ADAPTIVE_TASK_SELECTION_README.md`
 to the existing text-classification Meta-Harness entry point. It uses one fixed
-worker and evaluates a selected subset of Symptom2Disease validation examples.
+worker and evaluates a selected subset of each configured classification validation pool.
+The file keeps its original name for existing links; S2D is now just one example.
 
 ## Configuration
 
@@ -67,6 +68,71 @@ then evaluates 10 validation examples once. Training may itself invoke the
 model depending on the candidate's learning method. Sampling and Monte Carlo
 probability simulations make no worker calls. The selector updates after each
 candidate, including candidates from the same proposer iteration.
+
+## Selecting datasets
+
+Use the same `datasets` list as the original Meta-Harness. A single entry is supported:
+
+```yaml
+datasets: [LawBench]
+```
+
+Or select several datasets in one run:
+
+```yaml
+datasets: [Symptom2Disease, LawBench, USPTO]
+dataset:
+  num_train: 200
+  num_val: 50
+  num_test: 100
+  overrides:
+    Symptom2Disease: {num_train: 200, num_val: 50, num_test: 212}
+    LawBench: {num_train: 200, num_val: 50, num_test: 100}
+    USPTO: {num_train: 50, num_val: 30, num_test: 100}
+```
+
+Only listed datasets run; an override does not enable a dataset. Defaults are merged
+with the selected dataset's overrides, just as in `benchmark.py`. Registry-supported
+classification tasks are accepted, including the transfer tasks supported by the
+existing loader. Data availability/download requirements are unchanged. Official
+MCE split limits and positive sizes are checked before the run; validation needs at
+least two examples. Larger official pools (e.g. FiNER's 100) are supported.
+
+The adaptive backbone is unchanged: the same priorities, redundancy computation,
+exploration, Monte Carlo inclusion probabilities, and estimators run independently
+inside each dataset. Example index 0 from LawBench never shares outcomes or redundancy
+history with example index 0 from USPTO. Candidate implementations are shared across
+datasets, but each gets a separate training memory. Selection fraction is applied
+PER dataset (0.2 gives 10/50 for LawBench and 6/30 for USPTO).
+The existing rounding rule is unchanged: max(1, int(pool_size * fraction)).
+
+A harness is ranked only when all selected datasets have committed results. Overall
+scores use the unweighted mean of dataset accuracies, matching the original average
+rather than weighting by pool size. `evolution_summary.jsonl` also reports per-dataset
+scores. Aggregate standard errors assume independent dataset sampling and remain
+approximate. Datasets and candidates are evaluated sequentially; per-example prediction
+concurrency inside the evaluator is unchanged.
+
+For runs other than single-S2D, artifact paths are dataset-qualified:
+
+- `selections/<dataset>/<iteration>-<candidate>.json`
+- `evaluations/<phase>/<dataset>/<candidate>/` (attempt logs, results, memory and trace)
+
+Single-S2D keeps its previous paths. Selection/evaluation/history events identify the
+dataset, and `run_started` lists validation pool sizes. An interrupted candidate resumes
+only the missing dataset evaluations and keeps already-frozen plans.
+
+Finalization with `--test` confirms the same top-three overall shortlist on ALL configured
+validation pools, chooses one overall winner by mean full-validation accuracy, then tests
+that winner on every selected dataset, reusing each dataset's saved training memory.
+`finalized.json` records `confirmation_per_dataset` and `test_per_dataset`; `test_accuracy`
+is the macro average and `test_examples` is the sum of test counts. Already-measured full
+validation results are reused. This remains a separate finalization command, not an
+automatic stage appended to evolution.
+
+Use a NEW run name after this implementation update. The existing implementation-hash
+check deliberately rejects resuming old runs with changed evaluator code. Old artifacts
+are not deleted; finalize an old run using its matching code/configuration version.
 
 ## Defaults and controls
 
@@ -192,6 +258,7 @@ PYTHONPATH=.. uv run python -m unittest discover -s tests -v
 
 Tests cover sampling probabilities, supported/unsupported correlations, missing
 observations, identical-source grouping, inclusion-probability simulations, JSON
-plan persistence, the real S2D loader with a fake worker, and a simulated
-proposal/selection/evaluation/resume/finalization flow. A real local-Qwen search
+plan persistence, the real S2D loader with a fake worker, single-LawBench and multi-dataset CLI runs with actual local data and fake models,
+dataset-history isolation, macro averaging, official split limits, and interrupted
+multi-dataset resume/finalization flows. A real local-Qwen search
 must still be run in your GPU container.
