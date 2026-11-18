@@ -1,139 +1,88 @@
 ---
 name: meta-harness
-description: Run one iteration of memory system evolution. Called by meta_harness.py or interactively via /meta-harness.
+description: Propose one bounded iteration of memory-system evolution.
 ---
 
-# Meta-Harness (Memory System Evolution)
+# Meta-Harness proposer
 
-Run ONE iteration of memory system evolution. Do all work in the main session — do NOT delegate to subagents. Constraints get lost when you delegate, leading to parameter-only changes and skipped prototyping.
+Deliver exactly THREE new candidate memory systems and pending_eval.json for this iteration. The outer loop evaluates them. Work in this session; do not delegate. Prefer a small, correct mechanism change to an elaborate unfinished design. These instructions also apply when Claude Code is connected to a local model.
 
-**You do NOT run benchmarks.** You analyze results + prediction traces, prototype changes, and implement new systems. The outer loop (`meta_harness.py`) handles benchmarking separately.
+## Execution budget and completion
 
-## CRITICAL CONSTRAINTS
+- Target at most 30 tool calls in total: roughly 6 for inspection, then implementation and checks. This is a planning target, not an enforced limit.
+- Spend at most one quarter of the session inspecting history. Start implementing immediately afterward. If the context already contains the needed information, do not read it again.
+- Use the compact history in the task prompt first. Read at most one recent report and, only if necessary, at most three failure/prediction records. Never print complete log.jsonl, memory.json, prompts, checkpoints, or all reports. They can contain enormous repeated text.
+- Do not search the whole repository, inspect unrelated runs, research external methods, run benchmarks, call a real model to test prototypes, install packages, or make parameter sweeps.
+- Produce one implementation per hypothesis. Do one small offline correctness check per candidate instead of trying 2-3 algorithm variants. Repair a failing check with a targeted edit; simplify the mechanism if needed.
+- As soon as a candidate passes its check, add it to the pending_eval.json manifest. Update the manifest as the other candidates pass. Finish with exactly three checked entries and exit promptly; do not continue exploring after submission.
+- Do not claim improvement before the outer evaluator measures it. Never stop because the frontier seems optimal.
 
-- You MUST implement 3 new memory systems every iteration.
-- Do NOT write "the frontier is optimal" or "stop iterating", or abort early.
-- ALWAYS complete all steps including prototyping.
-- Design exactly 3 candidates per iteration: mix of exploitation and exploration.
+## Focused workflow
 
-### Anti-parameter-tuning rules
+1. Use the exact paths in the task prompt. Read config.yaml, memory_system.py, agents/fewshot_memory.py, and ONE useful frontier implementation if needed. Missing optional history is normal; do not repeatedly search for it.
+2. Write three short falsifiable hypotheses covering different mechanisms. Include exploitation of a successful mechanism and exploration of a different mechanism. Record the hypothesis and base_system in the manifest; keep explanations brief.
+3. Create each candidate as a new agents/<snake_case_name>.py file. Reuse working imports, answer extraction, serialization, and prompt boundaries. Change only the mechanism needed for the hypothesis.
+4. Run the bounded correctness check below. Write/update the manifest immediately after a pass.
+5. Finish with CANDIDATES: <name1>, <name2>, <name3>.
 
-The most common failure mode is creating systems that are just parameter variants of existing ones. Check `evolution_summary.jsonl` for what's been tried — parameter sweeps (pool sizes, retrieval counts, context budgets, similarity metrics) almost always regress or tie.
+## Candidate constraints
 
-**Good candidates change a fundamental mechanism:**
+- Exactly three candidates; do not submit three numeric variants of the same algorithm. A change to retrieval logic, memory representation, prompt organization, or learning logic is appropriate. Combining proven mechanisms is allowed.
+- General-purpose code only: no hardcoded dataset names, language-specific legal/medical knowledge, label lists, or validation-answer lookup tables. Learn any label-dependent information from the training examples.
+- Only create NEW agent modules and a small temporary check script. Do not edit baselines, existing agents, evaluator, config, data, dependencies, or past results. No registration edits are needed.
+- Never access held-out test data/results. Validation history may guide the hypothesis; never embed its examples or answers in candidate code.
+- Favor deterministic local computation and one worker call per predict(). Do not add per-example model calls in training, repeated summaries of all labels on every update, voting, or unbounded refinement loops in this budgeted run. These choices change the search space and must be documented when comparing experiments.
+- Respect the existing character cap and preserve the complete query/instructions. A request for a short response does not enforce a generation-token limit.
 
-- A new retrieval algorithm (e.g. contrastive pairs, diversity-aware selection, graph-based traversal)
-- A new prompt architecture (e.g. organize by confusion clusters instead of listing examples sequentially)
-- A new learning strategy (e.g. LLM-generated lesson summaries instead of raw example storage)
-- A new memory structure (e.g. separate fast/slow pools, hierarchical organization, compressed representations)
+## Interface and known pitfalls
 
-**Bad candidates just tune numbers.** If the logic in `predict()` and `learn_from_batch()` is identical to the base except for constants, it's a parameter variant. Rewrite with a genuinely novel mechanism.
+Extend MemorySystem from ..memory_system. Import LLMCallable from ..llm and extract_json_field from ..memory_system. Constructor must work with only llm. Use self.call_llm(prompt), not the client directly. predict(input) returns (answer_string, metadata_dict), using extract_json_field(response, "final_answer").
 
-**Combining systems is valid.** Take the retrieval strategy from system A and the memory format from system B, or draw on published approaches (DSPy, OPRO, Reflexion, CEIL, etc.).
+- Cold-start predict() must work before learning.
+- learn_from_batch receives input, prediction, ground_truth, was_correct; metadata and raw_question are OPTIONAL. Ground truth is already visible in offline mode; prediction may equal ground_truth. Do not infer actual model errors from these synthetic offline records.
+- The training loop calls learn_from_batch repeatedly, with batches of size 1 or larger. Retain prior examples. Store index = len(self.examples) BEFORE appending. Never use start_idx + len(self.examples): the existing length already includes earlier batches.
+- Use hashlib.sha256, NOT hashlib.sha_256. Preserve deterministic per-input seeds and avoid global random.seed().
+- Validation calls predict() concurrently on the SAME instance (up to 32 threads). Keep learned memory read-only during prediction and avoid shared mutable per-query buffers.
+- get_state() returns a JSON string. set_state() must rebuild all retrieval indexes/caches needed by predict(), so a restored agent works without retraining. Serialize sorted lists instead of sets.
+- Avoid broad exception handling that silently hides programming errors.
 
-Exploitation axes: A=Prompt template, B=Memory content, C=Selection algorithm, D=Memory sizing, E=Learning trigger, F=LLM usage in learning. If last 3 iterations explored the same axis, pick different ones.
+## Required small correctness prototype (no real model calls)
 
-### Anti-overfitting rules
+Use the active interpreter and package root given in the task prompt. Do not repeatedly guess uv project paths or package imports. Import candidate classes from text_classification.agents.<name>; modules use relative imports and cannot be executed directly.
 
-- **No dataset-specific hints.** Do not hardcode knowledge about specific datasets. Memory systems must be general-purpose.
-- **Never mention dataset names** in system code, prompts, or comments.
-- **General patterns are OK.** Rules like "prioritize recent errors" or "balance label coverage" are fine — they apply broadly.
+Create one temporary Python script outside agents/ and reuse it for all three candidates. Instantiate each class with this stub:
 
-## WORKFLOW
+    def fake_llm(prompt):
+        return '{"reasoning":"smoke check","final_answer":"label_a"}'
 
-**Do ALL steps yourself in the main session.**
+Use six tiny synthetic training records across two labels. Each record contains input, prediction, ground_truth, was_correct; omit metadata/raw_question on some records. Check:
 
-### Step 0: Post-eval reports (write if missing)
+1. Cold-start predict().
+2. Train on TWO consecutive batches (three records each), then predict(). This catches indexes that double-count history.
+3. Repeat on a fresh instance with six singleton batches, then predict().
+4. Parse get_state() with json.loads; restore into a fresh instance using set_state(); predict again. Check predictions have a string answer and dictionary metadata.
+5. Use ThreadPoolExecutor(max_workers=2) for two predictions on that restored instance; verify learned state is unchanged.
 
-Check the reports directory (path in the task prompt's "Run directories" section). For each past iteration that has results in `evolution_summary.jsonl` but NO report, write one. Each report should be **<=30 lines** covering: what changed, which datasets improved/regressed and why, and a takeaway for future iterations.
+These checks establish basic runtime compatibility, not accuracy. Keep the script small; delete only your own temporary script afterward. If a check fails, inspect its short traceback and repair the NEW candidate, not the evaluator.
 
-### Step 1: Analyze
+## Submission schema
 
-1. **Read all state files:**
-   - `evolution_summary.jsonl` — what's been tried (one JSON per candidate)
-   - `frontier_val.json` — current best per dataset (val accuracy)
-   - `config.yaml` for current datasets and baselines
-   - recent `logs/<dataset>/<agent>/<model>/log.jsonl` traces if they exist
-
-2. Formulate 3 hypotheses — each must be falsifiable and target a different mechanism.
-
-### Step 2: Prototype — MANDATORY
-
-**You MUST prototype your mechanism before writing the final system.** Do NOT skip this step. Candidates that skip prototyping tend to have bugs or produce no improvement.
-
-For each candidate:
-
-1. Write a test script in `/tmp/` that exercises the core retrieval/learning logic in isolation.
-2. Pull real examples from `logs/<dataset>/<memory>/<model>/log.jsonl` to test against.
-3. Try 2-3 variants and compare before picking the best one.
-4. Delete scripts when done.
-
-### Step 3: Implement
-
-For each of the 3 candidates:
-
-1. Copy a top-performing base system to `agents/<name>.py`, then make targeted modifications. This copy-then-edit approach ensures correct imports and proven patterns.
-2. Implement the new mechanism according to your hypothesis.
-3. **Self-critique (mandatory):** After implementing, re-read the file and check: does this system introduce a genuinely NEW mechanism, or is it just a parameter variant? If the logic in `predict()` and `learn_from_batch()` is identical to the base except for numbers, REWRITE with a truly novel mechanism.
-4. Validate: `uv run python -c "from text_classification.agents.<name> import *; print('OK')"`
-
-Do not edit `config.yaml` just to register candidates. The benchmark auto-discovers files in `agents/`.
-
-### Step 4: Write pending_eval.json
-
-Write to the path specified in the task prompt (NOT hardcoded — it may be in a run-specific subdirectory):
+Write valid JSON at the EXACT pending_eval path from the task prompt:
 
 ```json
 {
-  "iteration": <N>,
+  "iteration": 1,
   "candidates": [
     {
-      "name": "<snake_case_name>",
-      "file": "agents/<name>.py",
-      "hypothesis": "<falsifiable claim>",
-      "axis": "exploitation|exploration",
-      "base_system": "<what it builds on>",
-      "components": ["tag1", "tag2", "..."]
+      "name": "new_mechanism",
+      "file": "agents/new_mechanism.py",
+      "hypothesis": "A short measurable claim relative to the base",
+      "axis": "exploitation",
+      "base_system": "fewshot_all",
+      "components": ["mechanism_tag"]
     }
   ]
 }
 ```
 
-Output: `CANDIDATES: <name1>, <name2>, <name3>`
-
-## MemorySystem Interface
-
-```python
-class MemorySystem(ABC):
-    def __init__(self, llm: LLMCallable): ...
-    def predict(self, input: str) -> tuple[str, dict[str, Any]]: ...
-    def learn_from_batch(self, batch_results: list[dict[str, Any]]) -> None: ...
-    def get_state(self) -> str: ...       # JSON-serializable
-    def set_state(self, state: str) -> None: ...
-```
-
-- Extend `MemorySystem` from `..memory_system`
-- Import `LLMCallable` from `..llm`, `extract_json_field` from `..memory_system`
-- Use `extract_json_field(response, "final_answer")` for answer extraction (NOT custom regex)
-- Use `self.call_llm(prompt)` for LLM calls (NOT `self._llm` directly)
-- `predict` must work without any prior learning (cold start)
-- `learn_from_batch` receives list of dicts with keys: input, prediction, ground_truth, was_correct, metadata
-
-## Directory Structure
-
-- Val results: `logs/<dataset>/<memory>/<model>/val.json` (accuracy field)
-- Training logs: `logs/<dataset>/<memory>/<model>/log.jsonl`
-- Memory state: `logs/<dataset>/<memory>/<model>/memory.json`
-- Test results: `results/<dataset>/<memory>/<model>/test.json` (separate dir, never exposed during evolution)
-
-## evolution_summary.jsonl Format
-
-One JSON object per line, one line per evaluated candidate:
-
-```json
-{"iteration": 1, "system": "example_system", "avg_val": 45.0, "axis": "exploitation", "hypothesis": "...", "delta": +2.1, "outcome": "45.0% (+2.1)", "components": ["tag1", "tag2", "tag3"]}
-```
-
-## Component Analysis
-
-Treat `evolution_summary.jsonl`, `frontier_val.json`, and recent training traces as the only shipped history sources in this trimmed repo.
+Use the actual iteration number. The final candidates array must contain exactly THREE entries with unique new names. Incomplete manifests are not a completed proposal. Do not run evaluation yourself; exit after submission.
