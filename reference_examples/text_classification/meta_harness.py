@@ -226,6 +226,9 @@ def propose_claude(task_prompt, iteration, timeout=2400):
         "METAHARNESS_PROPOSER_EFFORT", "" if custom_endpoint else "max"
     ) or None
     try:
+        isolation = {}
+        if getattr(sys.modules[__name__], "PROPOSAL_WORKSPACE", None):
+            isolation["write_workspace"] = PROPOSAL_WORKSPACE
         result = claude_wrapper.run(
             prompt=task_prompt,
             model=model,
@@ -236,6 +239,7 @@ def propose_claude(task_prompt, iteration, timeout=2400):
             name=f"iter{iteration}",
             timeout_seconds=timeout,
             effort=effort,
+            **isolation,
         )
     finally:
         if saved_key is not None:

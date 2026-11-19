@@ -10,6 +10,7 @@ import os
 import queue
 import re
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -519,6 +520,7 @@ def run(
     disable_mcp=True,
     progress=True,
     effort=None,
+    write_workspace=None,
 ):
     """Run `claude -p` and return parsed SessionResult. Logs to log_dir.
 
@@ -566,6 +568,10 @@ def run(
         disable_mcp=disable_mcp,
         effort=effort,
     )
+
+    if write_workspace is not None:
+        sandbox = Path(__file__).with_name("proposal_sandbox.py")
+        cmd = [sys.executable, str(sandbox), "--workspace", str(write_workspace), "--", *cmd]
 
     effective_cwd = cwd or os.getcwd()
 

@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from adaptive_selection import digest, estimate, make_plan
+from proposal_workspace import (accept_proposal, archive_source, install_prepared_sources,
+                                preserve_sources, proposal_workspace)
 
 
 def read_json(path):
@@ -344,6 +346,7 @@ def run_adaptive_evolution(args, harness):
                 ".claude-cli", ".empty_plugins", "tests"))
             code.parent.mkdir(exist_ok=True)
             staging.rename(code)
+        preserve_sources(root, code, state["records"], file_hash, event)
         baselines = cfg["memory_systems"]["baselines"]
         state.setdefault("protected_agents", sorted(p.stem for p in (code / "agents").glob("*.py")))
         protected = protected_files(code, state["protected_agents"])
@@ -361,6 +364,7 @@ def run_adaptive_evolution(args, harness):
 
         for name in baselines:
             source_hash = file_hash(code / "agents" / f"{name}.py")
+            archive_source(root, name, source_hash, (code / "agents" / f"{name}.py").read_bytes())
             candidate_id = f"baseline:{name}:{source_hash}"
             for dataset in datasets:
                 if completed_record(state, candidate_id, dataset):
@@ -386,7 +390,7 @@ def run_adaptive_evolution(args, harness):
                 raise ValueError("Finish the interrupted search iteration before final testing")
             finalize(root, code, cfg, args, state)
             return
-        # Proposer reads and writes inside the run's source snapshot.
+        # Canonical paths are used only by the evaluator; proposals get disposable copies.
         harness.EVOLVE_DIR = code
         harness.LOGS_DIR = root
         harness.PENDING_EVAL = root / "pending_eval.json"
@@ -400,35 +404,33 @@ def run_adaptive_evolution(args, harness):
             save_json(state_path, state)
             proposal_path = root / f"iteration-{iteration:04d}.json"
             if not proposal_path.exists():
-                harness.PENDING_EVAL.unlink(missing_ok=True)
                 event(root, "proposal_started", iteration=iteration)
-                prompt = harness.render_task_prompt(iteration, len(datasets)) + (
-                    "\nValidation uses sampled examples. Compare candidates with est_full_val, "
-                    "not raw subset accuracy. Each dataset has its own pool/history; overall scores "
-                    "are unweighted dataset means. Only edit NEW agents/<name>.py files. "
-                    "Evaluator/config/data and existing candidates must remain unchanged.")
-                if not harness.propose_claude(prompt, iteration, timeout=args.propose_timeout):
-                    event(root, "proposal_failed", iteration=iteration)
-                    raise RuntimeError("Proposer produced no usable pending_eval.json; inspect claude_sessions")
-                if protected_files(code, state["protected_agents"]) != protected:
-                    raise ValueError("Proposer modified protected evaluation files")
-                verify_candidate_sources(code, state["records"])
-                proposal = read_json(harness.PENDING_EVAL)
-                candidates = proposal.get("candidates") or []
-                if not candidates:
-                    raise ValueError("Proposer returned an empty candidate list")
-                names = [c["name"] for c in candidates]
-                known = {r["name"] for r in state["records"]}
-                if len(set(names)) != len(names) or known.intersection(names):
-                    raise ValueError("Candidate names must be new and unique")
-                for candidate in candidates:
-                    name = candidate["name"]
-                    if not re.fullmatch(r"[a-z][a-z0-9_]*", name):
-                        raise ValueError(f"Invalid candidate module name: {name}")
-                    candidate["source_hash"] = file_hash(code / "agents" / f"{name}.py")
-                    candidate["candidate_id"] = f"iter{iteration}:{name}:{candidate['source_hash']}"
-                save_json(proposal_path, proposal)
-                event(root, "proposal_completed", iteration=iteration, candidates=names)
+                try:
+                    with proposal_workspace(root, code, harness, iteration, datasets,
+                                            file_hash, event) as (workspace, work_code, existing):
+                        prompt = harness.render_task_prompt(iteration, len(datasets)) + (
+                            "\nValidation uses sampled examples. Compare candidates with est_full_val, "
+                            "not raw subset accuracy. Each dataset has its own pool/history; overall "
+                            "scores are unweighted dataset means. This is a disposable proposal workspace. "
+                            "Only NEW agents/<name>.py files will be imported. Use names prefixed with "
+                            f"iter{iteration:04d}_ and never reuse or delete an existing filename. "
+                            "Existing agent/evaluator/config/data files must remain unchanged. "
+                            "Put temporary check scripts outside the code directory, within this workspace. "
+                            "Filesystem writes outside the workspace are blocked, including from Bash.")
+                        if not harness.propose_claude(prompt, iteration, timeout=args.propose_timeout):
+                            raise RuntimeError("Proposer produced no usable pending_eval.json; inspect proposal workspace logs")
+                        if protected_files(code, state["protected_agents"]) != protected:
+                            raise ValueError("Canonical protected files changed during proposal")
+                        verify_candidate_sources(code, state["records"])
+                        proposal = accept_proposal(root, code, work_code, existing,
+                            harness.PENDING_EVAL, iteration, file_hash, save_json)
+                except Exception as error:
+                    event(root, "proposal_rejected", iteration=iteration, error=str(error),
+                          message="No unvalidated agent files imported; prior results retained")
+                    raise
+                event(root, "proposal_completed", iteration=iteration,
+                      candidates=[c["name"] for c in proposal["candidates"]])
+            install_prepared_sources(root, code, read_json(proposal_path)["candidates"], file_hash, event)
             for candidate in read_json(proposal_path)["candidates"]:
                 name, candidate_id = candidate["name"], candidate["candidate_id"]
                 if harness._interrupted:

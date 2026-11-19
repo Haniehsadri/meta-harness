@@ -237,6 +237,51 @@ hard kill, inspect the PID/host recorded in that file and confirm the old proces
 has exited before manually removing the stale lock. `--fresh` and `--skip-baseline`
 are rejected for this opt-in mode to avoid accidentally discarding initialization.
 
+## Proposer file protection
+
+Adaptive proposals now run in disposable copies under
+`proposals/iteration-NNNN/attempt-NNN/`, not in the canonical evaluator snapshot.
+The proposer gets copied validation summaries and exact workspace paths. Its
+`Write`, `Edit`, and Bash child processes inherit Linux Landlock restrictions:
+file contents and directory entries outside the workspace cannot be changed.
+The only external writable device granted is `/dev/null`. On Landlock ABI 1/2,
+a seccomp guard also blocks legacy path-truncation bypasses. If required kernel
+protections are unavailable, the proposer exits with code 125; there is no
+unprotected fallback. Supported architectures are Linux x86_64 and aarch64.
+This was tested as root in the current Docker container (Landlock ABI 1).
+
+This is filesystem mutation confinement, not a general network/process security
+sandbox. Reads and network access remain available; generated evaluator code
+still executes under the existing evaluation trust model. File metadata operations
+are not covered by Landlock. Runtime cache, temporary files, and Claude session
+configuration are private to `.runtime/` inside the workspace. Keep the existing
+local-model endpoint/auth environment variables. Subscription users must configure
+credentials in that private runtime; the wrapper does not copy personal CLI history
+or credentials automatically.
+
+The runner rejects modifications/deletions of existing workspace source/config/data,
+reused names (including unevaluated existing modules), symlinks, duplicate names,
+and invalid Python syntax. Names prefixed `iterNNNN_` are requested in the prompt;
+actual existing-name collision checks are enforced regardless of the chosen prefix.
+Only listed, accepted new agent modules are imported. No candidate count, sampling,
+training, scoring, estimation, or finalization policy is changed. The normal
+(non-adaptive) path keeps its previous proposer invocation.
+
+Canonical `source_archive/<sha256>.py` files preserve the exact accepted source and
+verified baselines. Agent imports are atomically published without overwriting any
+existing filename. A prepared iteration manifest plus those archives allows resume
+after an interrupted import. Missing evaluated files can be restored only from a
+matching archive; modified files or corrupt archives cause an explicit error.
+This cannot reconstruct a file already lost in an old run with no source archive.
+
+Proposer sessions are retained inside each attempt's `context/claude_sessions/`.
+Events include `proposal_workspace_created`, `proposal_rejected`,
+`candidate_source_imported`, and `candidate_source_restored`. A rejected proposal
+stops the invocation with completed results retained; it does not fabricate scores
+or silently generate replacement candidates. A retry uses a new attempt directory.
+Implementation changes still require a new run name; do not bypass the old-run
+source/implementation checks to resume a damaged historical experiment.
+
 ## Final confirmation and test
 
 After candidate selection, repeat the same command and settings with `--test`
