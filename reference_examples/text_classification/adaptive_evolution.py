@@ -14,7 +14,7 @@ from pathlib import Path
 
 from adaptive_selection import digest, estimate, make_plan
 from proposal_workspace import (accept_proposal, archive_source, install_prepared_sources,
-                                preserve_sources, proposal_workspace)
+                                preserve_sources, proposal_workspace, resolve_pending_manifest)
 
 
 def read_json(path):
@@ -412,7 +412,9 @@ def run_adaptive_evolution(args, harness):
                             "\nValidation uses sampled examples. Compare candidates with est_full_val, "
                             "not raw subset accuracy. Each dataset has its own pool/history; overall "
                             "scores are unweighted dataset means. This is a disposable proposal workspace. "
-                            "Only NEW agents/<name>.py files will be imported. Use names prefixed with "
+                            "Write pending_eval.json in your current working directory and include "
+                            f"iteration={iteration}. Only NEW agents/<name>.py files will be imported. "
+                            "Use names prefixed with "
                             f"iter{iteration:04d}_ and never reuse or delete an existing filename. "
                             "Existing agent/evaluator/config/data files must remain unchanged. "
                             "Put temporary check scripts outside the code directory, within this workspace. "
@@ -422,8 +424,14 @@ def run_adaptive_evolution(args, harness):
                         if protected_files(code, state["protected_agents"]) != protected:
                             raise ValueError("Canonical protected files changed during proposal")
                         verify_candidate_sources(code, state["records"])
+                        pending = resolve_pending_manifest(workspace, work_code, iteration)
+                        if pending is None:
+                            raise RuntimeError("No proposal manifest in this attempt's known submission locations")
+                        if pending != harness.PENDING_EVAL:
+                            event(root, "proposal_manifest_recovered", iteration=iteration,
+                                  expected=str(harness.PENDING_EVAL), actual=str(pending))
                         proposal = accept_proposal(root, code, work_code, existing,
-                            harness.PENDING_EVAL, iteration, file_hash, save_json)
+                            pending, iteration, file_hash, save_json)
                 except Exception as error:
                     event(root, "proposal_rejected", iteration=iteration, error=str(error),
                           message="No unvalidated agent files imported; prior results retained")

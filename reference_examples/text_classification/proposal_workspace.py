@@ -63,7 +63,7 @@ def proposal_workspace(root, code, harness, iteration, datasets, file_hash, even
     workspace = directory / f"attempt-{attempt:03d}"
     work_code = workspace / "code" / "text_classification"
     shutil.copytree(code, work_code, ignore=shutil.ignore_patterns(
-        "__pycache__", ".runtime", ".empty_plugins", ".venv", "*.log"))
+        "__pycache__", ".runtime", ".empty_plugins", ".venv", "*.log", "pending_eval.json"))
     context = workspace / "context"
     context.mkdir()
     for name in ("frontier_val.json", "evolution_summary.jsonl"):
@@ -75,7 +75,7 @@ def proposal_workspace(root, code, harness, iteration, datasets, file_hash, even
     existing = {str(p.relative_to(work_code)): file_hash(p)
                 for p in work_code.rglob("*") if p.is_file()}
     attrs = {"EVOLVE_DIR": work_code, "LOGS_DIR": context,
-             "PENDING_EVAL": context / "pending_eval.json",
+             "PENDING_EVAL": work_code / "pending_eval.json",
              "FRONTIER_VAL": context / "frontier_val.json",
              "EVOLUTION_SUMMARY": context / "evolution_summary.jsonl",
              "PROPOSAL_WORKSPACE": workspace}
@@ -95,6 +95,47 @@ def proposal_workspace(root, code, harness, iteration, datasets, file_hash, even
                 setattr(harness, name, value)
 
 
+def read_submission(path, iteration):
+    """Reject stale or incomplete manifests rather than guessing their iteration."""
+    try:
+        proposal = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"Unreadable proposal manifest {path}: {error}") from error
+    if not isinstance(proposal, dict) or type(proposal.get("iteration")) is not int or proposal["iteration"] != iteration:
+        raise ValueError(f"Proposal manifest must declare iteration {iteration}: {path}")
+    candidates = proposal.get("candidates")
+    if not isinstance(candidates, list) or not candidates or any(not isinstance(c, dict) for c in candidates):
+        raise ValueError(f"Proposal manifest must contain nonempty candidate objects: {path}")
+    return proposal
+
+
+def resolve_pending_manifest(workspace, work_code, iteration):
+    """Resolve only known submission paths inside THIS isolated proposal attempt.
+
+    Prefer cwd/pending_eval.json. Other known paths are accepted only when all
+    existing manifests agree; never recursively scan runs or use older attempts.
+    """
+    workspace = Path(workspace).resolve()
+    work_code = Path(work_code)
+    if not work_code.resolve().is_relative_to(workspace):
+        raise ValueError("Proposal code directory escaped its workspace")
+    locations = [work_code / "pending_eval.json", workspace / "context/pending_eval.json",
+                 workspace / "pending_eval.json", work_code.parent / "pending_eval.json"]
+    found = []
+    for path in locations:
+        if path.is_symlink():
+            raise ValueError(f"Proposal manifest must not be a symlink: {path}")
+        if not path.exists():
+            continue
+        if not path.is_file() or not path.resolve().is_relative_to(workspace):
+            raise ValueError(f"Proposal manifest escaped its workspace: {path}")
+        found.append((path, read_submission(path, iteration)))
+    if not found:
+        return None
+    if any(value != found[0][1] for _, value in found[1:]):
+        raise ValueError("Conflicting proposal manifests: " + ", ".join(str(p) for p, _ in found))
+    return found[0][0]
+
 def accept_proposal(root, code, work_code, existing, pending, iteration, file_hash, save_json):
     """Validate the copy, archive accepted bytes, and durably prepare imports."""
     changed = [name for name, expected in existing.items()
@@ -102,7 +143,7 @@ def accept_proposal(root, code, work_code, existing, pending, iteration, file_ha
                or file_hash(work_code / name) != expected]
     if changed:
         raise ValueError(f"Proposal changed existing workspace files: {changed[:5]}")
-    proposal = json.loads(pending.read_text(encoding="utf-8-sig"))
+    proposal = read_submission(pending, iteration)
     candidates = proposal.get("candidates") or []
     if not candidates:
         raise ValueError("Proposer returned an empty candidate list")
@@ -115,6 +156,8 @@ def accept_proposal(root, code, work_code, existing, pending, iteration, file_ha
     reserved = {p.stem for p in (code / "agents").iterdir()}
     for candidate in candidates:
         name = candidate["name"]
+        if candidate.get("file", f"agents/{name}.py") != f"agents/{name}.py":
+            raise ValueError(f"Candidate file does not match module name: {name}")
         if name in reserved:
             raise ValueError(f"Candidate name already exists: {name}")
         path = work_code / "agents" / f"{name}.py"

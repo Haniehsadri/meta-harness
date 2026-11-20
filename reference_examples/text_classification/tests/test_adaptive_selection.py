@@ -170,7 +170,7 @@ class EvolutionIntegrationTests(unittest.TestCase):
                 def propose(prompt, iteration, timeout):
                     name = f"candidate_{iteration}"
                     (h.EVOLVE_DIR / "agents" / f"{name}.py").write_text(f"# {name}\n")
-                    evolution.save_json(h.PENDING_EVAL, {"candidates": [{"name": name}]})
+                    evolution.save_json(h.PENDING_EVAL, {"iteration": iteration, "candidates": [{"name": name}]})
                     return True
                 h.propose_claude = propose
                 return h
@@ -262,7 +262,7 @@ class CommandLinePipelineTests(unittest.TestCase):
                 "    code = Path(kwargs['cwd'])\n"
                 "    src = (code / 'agents/no_memory.py').read_text()\n"
                 "    (code / 'agents/pilot_candidate.py').write_text('# pilot' + chr(10) + src)\n"
-                "    harness.PENDING_EVAL.write_text(json.dumps({'candidates': "
+                "    harness.PENDING_EVAL.write_text(json.dumps({'iteration': int(kwargs['name'][4:]), 'candidates': "
                 "[{'name': 'pilot_candidate', 'hypothesis': 'test plumbing'}]}))\n"
                 "    return SimpleNamespace(exit_code=0, show=lambda: None)\n"
                 "harness.claude_wrapper.run = propose\n"

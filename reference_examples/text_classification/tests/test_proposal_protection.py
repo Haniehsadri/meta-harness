@@ -39,7 +39,7 @@ class ProposalProtectionTests(unittest.TestCase):
                         target.unlink()
                     else:
                         target.write_text("# changed")
-                    e.save_json(harness.PENDING_EVAL, {"candidates": [{"name":"old"}]})
+                    e.save_json(harness.PENDING_EVAL, {"iteration": 8, "candidates": [{"name":"old"}]})
                     with self.assertRaisesRegex(ValueError, "existing workspace files"):
                         accept_proposal(root, code, work, existing, harness.PENDING_EVAL, 8, e.file_hash, e.save_json)
                 self.assertEqual(e.file_hash(code / "agents/old.py"), record["source_hash"])
@@ -57,7 +57,7 @@ class ProposalProtectionTests(unittest.TestCase):
                         (work/"agents/new.py").symlink_to(code/"agents/old.py")
                     elif kind == "syntax":
                         (work/"agents/new.py").write_text("def broken(")
-                    e.save_json(harness.PENDING_EVAL, {"candidates":[{"name": name}]})
+                    e.save_json(harness.PENDING_EVAL, {"iteration": 8, "candidates":[{"name": name}]})
                     with self.assertRaises((ValueError, SyntaxError)):
                         accept_proposal(root, code, work, existing, harness.PENDING_EVAL, 8, e.file_hash, e.save_json)
                 self.assertFalse((code/"agents/new.py").exists())
@@ -68,7 +68,7 @@ class ProposalProtectionTests(unittest.TestCase):
             root, code, record, harness = self.prepare(tmp)
             with proposal_workspace(root, code, harness, 8, ["LawBench"], e.file_hash, e.event) as (_, work, existing):
                 (work/"agents/iter0008_new.py").write_text("# new implementation\n")
-                e.save_json(harness.PENDING_EVAL, {"candidates":[{"name":"iter0008_new"}]})
+                e.save_json(harness.PENDING_EVAL, {"iteration": 8, "candidates":[{"name":"iter0008_new"}]})
                 result = accept_proposal(root, code, work, existing, harness.PENDING_EVAL, 8, e.file_hash, e.save_json)
             self.assertFalse((code/"agents/iter0008_new.py").exists())
             self.assertTrue((root/"iteration-0008.json").exists())

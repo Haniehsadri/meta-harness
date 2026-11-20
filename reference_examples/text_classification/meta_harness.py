@@ -250,6 +250,9 @@ def propose_claude(task_prompt, iteration, timeout=2400):
             print(f"  {_dim(result.stderr[:500])}")
         return False
     result.show()
+    if isolation:
+        from proposal_workspace import resolve_pending_manifest
+        return resolve_pending_manifest(PROPOSAL_WORKSPACE, EVOLVE_DIR, iteration) is not None
     return PENDING_EVAL.exists()
 
 

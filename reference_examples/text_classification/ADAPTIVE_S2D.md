@@ -282,6 +282,32 @@ or silently generate replacement candidates. A retry uses a new attempt director
 Implementation changes still require a new run name; do not bypass the old-run
 source/implementation checks to resume a damaged historical experiment.
 
+### Proposal manifest submission and recovery
+
+The proposer now writes `pending_eval.json` in its working directory, beside
+`config.yaml` and `agents/`. A new workspace never inherits an old pending manifest.
+After a successful proposer exit the runner checks these fixed paths within THAT
+attempt only: working directory, `context/`, workspace root, and package parent.
+It does not search other runs or older attempts. A misplaced current manifest can
+therefore be recovered without rerunning the proposer, and the event
+`proposal_manifest_recovered` records the expected and actual paths.
+
+Every found manifest must declare the current integer iteration and contain
+candidate objects. If multiple manifests differ, or any is stale, malformed,
+symlinked, or outside the workspace, the proposal is rejected before imports.
+Identical duplicate submissions are harmless. The ordinary candidate checks
+still reject existing names, edits to prior files, invalid Python, and mismatched
+`file`/module names. A missing manifest or a nonzero proposer exit still fails
+explicitly rather than accepting a partial/untrusted proposal.
+
+These are I/O robustness changes, not changes to sampling, estimation, training,
+or final selection. The local Task-CoEvolve checkout also has misplaced-candidate
+file rescue and run archives; its successful runs do not guarantee that every
+proposer will always follow paths. That checkout's proposer still checks one
+exact pending-manifest location and does not provide the same content-addressed
+source-integrity checks. Do not remove our integrity checks to mimic a successful
+run; they protect against silently changing the meaning of saved scores.
+
 ## Final confirmation and test
 
 After candidate selection, repeat the same command and settings with `--test`

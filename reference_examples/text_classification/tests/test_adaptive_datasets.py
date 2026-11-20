@@ -92,7 +92,8 @@ class DatasetTests(unittest.TestCase):
                 def propose(prompt, iteration, timeout):
                     proposals.append(iteration)
                     (h.EVOLVE_DIR / "agents/candidate.py").write_text("# candidate")
-                    e.save_json(h.PENDING_EVAL, {"candidates": [{"name": "candidate"}]})
+                    e.save_json(h.PROPOSAL_WORKSPACE / "context/pending_eval.json",
+                                {"iteration": iteration, "candidates": [{"name": "candidate"}]})
                     return True
                 h.propose_claude = propose
                 return h
@@ -141,6 +142,7 @@ class DatasetTests(unittest.TestCase):
                 e.run_adaptive_evolution(args, harness())
                 self.assertEqual(len(calls), call_count)
             events = [json.loads(line) for line in (root / "events.jsonl").read_text().splitlines()]
+            self.assertTrue(any(row["stage"] == "proposal_manifest_recovered" for row in events))
             for row in events:
                 if row["stage"] in ("selection_started", "selection_frozen", "history_updated"):
                     self.assertIn(row["dataset"], cfg["datasets"])
