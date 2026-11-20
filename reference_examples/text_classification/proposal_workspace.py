@@ -2,6 +2,11 @@
 import ast
 import json
 import os
+import re
+import signal
+import subprocess
+import sys
+import time
 import tempfile
 import shutil
 from contextlib import contextmanager
@@ -136,7 +141,80 @@ def resolve_pending_manifest(workspace, work_code, iteration):
         raise ValueError("Conflicting proposal manifests: " + ", ".join(str(p) for p, _ in found))
     return found[0][0]
 
-def accept_proposal(root, code, work_code, existing, pending, iteration, file_hash, save_json):
+def normalize_candidate_submission(candidate, work_code, iteration):
+    """Resolve only an unambiguous current-iteration prefix mismatch.
+
+    The actual Python filename is authoritative. No file is renamed and no
+    source bytes change. Arbitrary aliases and two existing alternatives fail.
+    """
+    name = candidate.get("name")
+    if not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9_]*", name):
+        raise ValueError("Invalid candidate module name")
+    filename = candidate.get("file", f"agents/{name}.py")
+    match = re.fullmatch(r"agents/([a-z][a-z0-9_]*)\.py", filename) if isinstance(filename, str) else None
+    if not match:
+        raise ValueError(f"Candidate file does not match a safe agent module: {name}")
+    file_name = match.group(1)
+    resolved = name
+    if file_name != name:
+        prefix = f"iter{iteration:04d}_"
+        if file_name != prefix + name and name != prefix + file_name:
+            raise ValueError(f"Candidate file does not match module name: {name}")
+        named = work_code / "agents" / f"{name}.py"
+        declared = work_code / filename
+        named_exists = named.exists() or named.is_symlink()
+        declared_exists = declared.exists() or declared.is_symlink()
+        if named_exists == declared_exists:
+            raise ValueError(f"Ambiguous or missing candidate sources: {name}, {file_name}")
+        resolved = name if named_exists else file_name
+    result = {**candidate, "name": resolved, "file": f"agents/{resolved}.py"}
+    if result["name"] != name or result["file"] != filename:
+        result["original_submission"] = {"name": name, "file": filename}
+    return result
+
+def preflight_candidate_imports(workspace, work_code, candidates, root, event, timeout=30):
+    """Cheap import checks, like Task-CoEvolve, before worker evaluation.
+
+    Imports run in the write sandbox. No LLM is instantiated by this checker.
+    Stop its whole process group on timeout so a broken import cannot linger.
+    """
+    directory = workspace / "preflight"
+    directory.mkdir(exist_ok=True)
+    env = os.environ.copy()
+    env.update(PYTHONPATH=str(work_code.parent), PYTHONDONTWRITEBYTECODE="1",
+               LITELLM_LOCAL_MODEL_COST_MAP="True")
+    for candidate in candidates:
+        name = candidate["name"]
+        log = directory / f"{name}.log"
+        command = [sys.executable, str(Path(__file__).with_name("proposal_sandbox.py")),
+                   "--workspace", str(workspace), "--", sys.executable, "-B", "-c",
+                   f"import importlib; importlib.import_module('text_classification.agents.{name}'); print('IMPORT_OK')"]
+        event(root, "candidate_preflight_started", name=name, log=str(log), timeout=timeout)
+        started = time.monotonic()
+        with log.open("w", encoding="utf-8") as handle:
+            process = subprocess.Popen(command, cwd=work_code.parent, env=env,
+                stdin=subprocess.DEVNULL, stdout=handle, stderr=subprocess.STDOUT,
+                start_new_session=(os.name == "posix"))
+            try:
+                status = process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                if os.name == "posix":
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                else:
+                    process.kill()
+                process.wait()
+                status = 124
+        if status != 0:
+            event(root, "candidate_preflight_failed", name=name, exit_code=status,
+                  elapsed_seconds=time.monotonic()-started, log=str(log))
+            raise ValueError(f"Candidate import preflight failed: {name}; see {log}")
+        event(root, "candidate_preflight_completed", name=name,
+              elapsed_seconds=time.monotonic()-started, log=str(log))
+
+def accept_proposal(root, code, work_code, existing, pending, iteration, file_hash, save_json, preflight=None):
     """Validate the copy, archive accepted bytes, and durably prepare imports."""
     changed = [name for name, expected in existing.items()
                if not (work_code / name).is_file() or (work_code / name).is_symlink()
@@ -147,7 +225,8 @@ def accept_proposal(root, code, work_code, existing, pending, iteration, file_ha
     candidates = proposal.get("candidates") or []
     if not candidates:
         raise ValueError("Proposer returned an empty candidate list")
-    import re
+    candidates = [normalize_candidate_submission(c, work_code, iteration) for c in candidates]
+    proposal["candidates"] = candidates
     names = [c.get("name") for c in candidates]
     if any(not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9_]*", name) for name in names):
         raise ValueError("Invalid candidate module name")
@@ -167,6 +246,16 @@ def accept_proposal(root, code, work_code, existing, pending, iteration, file_ha
         ast.parse(content, filename=str(path))
         candidate["source_hash"] = file_hash(path)
         candidate["candidate_id"] = f"iter{iteration}:{name}:{candidate['source_hash']}"
+    if preflight is not None:
+        preflight(candidates)
+        # Import-time side effects must not alter any validated source.
+        for relative, expected in existing.items():
+            path = work_code / relative
+            if not path.is_file() or path.is_symlink() or file_hash(path) != expected:
+                raise ValueError(f"Preflight changed existing source: {relative}")
+        for candidate in candidates:
+            if file_hash(work_code / candidate["file"]) != candidate["source_hash"]:
+                raise ValueError(f"Preflight changed candidate source: {candidate['name']}")
     # Validate the complete manifest before archiving/importing any candidate.
     for candidate in candidates:
         name = candidate["name"]

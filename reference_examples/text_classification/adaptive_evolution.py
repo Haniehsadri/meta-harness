@@ -14,7 +14,8 @@ from pathlib import Path
 
 from adaptive_selection import digest, estimate, make_plan
 from proposal_workspace import (accept_proposal, archive_source, install_prepared_sources,
-                                preserve_sources, proposal_workspace, resolve_pending_manifest)
+                                preserve_sources, proposal_workspace, resolve_pending_manifest,
+                                preflight_candidate_imports)
 
 
 def read_json(path):
@@ -415,7 +416,9 @@ def run_adaptive_evolution(args, harness):
                             "Write pending_eval.json in your current working directory and include "
                             f"iteration={iteration}. Only NEW agents/<name>.py files will be imported. "
                             "Use names prefixed with "
-                            f"iter{iteration:04d}_ and never reuse or delete an existing filename. "
+                            f"iter{iteration:04d}_ and include that prefix in BOTH manifest name and file. "
+                            "The name must equal the Python filename without .py. "
+                            "Never reuse or delete an existing filename. "
                             "Existing agent/evaluator/config/data files must remain unchanged. "
                             "Put temporary check scripts outside the code directory, within this workspace. "
                             "Filesystem writes outside the workspace are blocked, including from Bash.")
@@ -431,11 +434,18 @@ def run_adaptive_evolution(args, harness):
                             event(root, "proposal_manifest_recovered", iteration=iteration,
                                   expected=str(harness.PENDING_EVAL), actual=str(pending))
                         proposal = accept_proposal(root, code, work_code, existing,
-                            pending, iteration, file_hash, save_json)
+                            pending, iteration, file_hash, save_json,
+                            preflight=lambda candidates: preflight_candidate_imports(
+                                workspace, work_code, candidates, root, event))
                 except Exception as error:
                     event(root, "proposal_rejected", iteration=iteration, error=str(error),
                           message="No unvalidated agent files imported; prior results retained")
                     raise
+                for candidate in proposal["candidates"]:
+                    if candidate.get("original_submission"):
+                        event(root, "proposal_submission_normalized", iteration=iteration,
+                              original=candidate["original_submission"],
+                              name=candidate["name"], file=candidate["file"])
                 event(root, "proposal_completed", iteration=iteration,
                       candidates=[c["name"] for c in proposal["candidates"]])
             install_prepared_sources(root, code, read_json(proposal_path)["candidates"], file_hash, event)
@@ -535,7 +545,12 @@ def finalize(root, code, cfg, args, state):
     final = read_json(marker)
     records = {r["name"]: r for r in ranked}
     confirmations, per_dataset = [], {}
-    for name in final["shortlist"]:
+    # Known full-validation evidence must not be discarded by noisy estimates.
+    # These additional comparisons reuse measured scores; no extra worker calls.
+    confirmation_names = list(final["shortlist"])
+    confirmation_names.extend(r["name"] for r in ranked
+                              if r["score"]["measured_full"] and r["name"] not in confirmation_names)
+    for name in confirmation_names:
         candidate = records[name]
         per_dataset[name] = {}
         for dataset in datasets:

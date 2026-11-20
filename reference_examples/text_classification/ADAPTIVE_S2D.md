@@ -264,7 +264,8 @@ reused names (including unevaluated existing modules), symlinks, duplicate names
 and invalid Python syntax. Names prefixed `iterNNNN_` are requested in the prompt;
 actual existing-name collision checks are enforced regardless of the chosen prefix.
 Only listed, accepted new agent modules are imported. No candidate count, sampling,
-training, scoring, estimation, or finalization policy is changed. The normal
+training, scoring, or estimation formula is changed by proposal protection. The
+finalization correction below separately retains known full-validation baselines. The normal
 (non-adaptive) path keeps its previous proposer invocation.
 
 Canonical `source_archive/<sha256>.py` files preserve the exact accepted source and
@@ -308,12 +309,39 @@ exact pending-manifest location and does not provide the same content-addressed
 source-integrity checks. Do not remove our integrity checks to mimic a successful
 run; they protect against silently changing the meaning of saved scores.
 
+### Iteration-prefix submission correction and early checks
+
+A logged proposal used `name: progressive_threshold` with
+`file: agents/iter0004_progressive_threshold.py`. Previously the strict check
+rejected the complete proposal. The runner now normalizes this limited case to
+the actual module filename when exactly one source exists and the names differ
+ONLY by the current iteration prefix. It never renames or edits the source.
+`original_submission` preserves the raw metadata and
+`proposal_submission_normalized` records the correction. Arbitrary aliases,
+wrong-iteration prefixes, two competing source files, normalized duplicate names,
+collisions, and unsafe paths remain errors.
+
+All submitted modules then receive a sandboxed import preflight before any are
+published or evaluated by the worker. Each check has a 30-second timeout; its
+process group is killed on timeout. Import side effects may not change existing
+or candidate source. Logs are in each attempt's `preflight/` directory with
+`candidate_preflight_started`, `candidate_preflight_completed`, and
+`candidate_preflight_failed` events. This catches missing imports and import-time
+failures; it is not a proof that every prediction or learning path is correct.
+
+The current run's first three completed iterations and rejected fourth proposal
+remain recoverable. Do not change its frozen implementation or fabricate results;
+recover validated submission metadata using its matching code before resuming.
+Use a new run name when adopting this implementation update.
+
 ## Final confirmation and test
 
 After candidate selection, repeat the same command and settings with `--test`
 instead of `--iterations 1`. The fixed protocol confirms the top three available
 harnesses (including eligible baselines) on full validation, reusing their saved
-training memories. It selects the best confirmed harness and evaluates that
+training memories. Already-measured full-validation baselines/harnesses remain
+eligible even if noisy subset estimates excluded them from the shortlist; their
+scores are reused without extra calls. It selects the best measured harness and evaluates that
 winner on the configured test split. Full-validation measurements already obtained
 are reused. Confirmation and test costs are logged separately.
 
