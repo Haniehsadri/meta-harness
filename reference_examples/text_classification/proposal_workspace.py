@@ -151,6 +151,14 @@ def normalize_candidate_submission(candidate, work_code, iteration):
     if not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9_]*", name):
         raise ValueError("Invalid candidate module name")
     filename = candidate.get("file", f"agents/{name}.py")
+    original_filename = filename
+    if isinstance(filename, str):
+        # Accept explicit package-relative and cwd-relative spellings only.
+        # Never collapse traversal, absolute paths, or arbitrary prefixes.
+        if filename.startswith("./"):
+            filename = filename[2:]
+        if filename.startswith("text_classification/"):
+            filename = filename[len("text_classification/"):]
     match = re.fullmatch(r"agents/([a-z][a-z0-9_]*)\.py", filename) if isinstance(filename, str) else None
     if not match:
         raise ValueError(f"Candidate file does not match a safe agent module: {name}")
@@ -168,8 +176,8 @@ def normalize_candidate_submission(candidate, work_code, iteration):
             raise ValueError(f"Ambiguous or missing candidate sources: {name}, {file_name}")
         resolved = name if named_exists else file_name
     result = {**candidate, "name": resolved, "file": f"agents/{resolved}.py"}
-    if result["name"] != name or result["file"] != filename:
-        result["original_submission"] = {"name": name, "file": filename}
+    if result["name"] != name or result["file"] != original_filename:
+        result["original_submission"] = {"name": name, "file": original_filename}
     return result
 
 def preflight_candidate_imports(workspace, work_code, candidates, root, event, timeout=30):

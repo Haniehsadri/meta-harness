@@ -115,3 +115,29 @@ class ManifestTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,"does not match"):
                 accept_proposal(root,root/"code",code,{},pending,10,e.file_hash,e.save_json)
             self.assertFalse((root/"iteration-0010.json").exists())
+
+    def test_safe_relative_spellings_preserve_source_and_original_metadata(self):
+        from proposal_workspace import normalize_candidate_submission
+        with tempfile.TemporaryDirectory() as tmp:
+            _, code = self.layout(tmp)
+            name = "iter0009_damped_adaptive_k"
+            source = code / "agents" / f"{name}.py"
+            source.write_text("# unchanged candidate\n")
+            before = source.read_bytes()
+            for prefix in ("", "./", "text_classification/", "./text_classification/"):
+                declared = f"{prefix}agents/{name}.py"
+                result = normalize_candidate_submission({"name": name, "file": declared}, code, 9)
+                self.assertEqual(result["file"], f"agents/{name}.py")
+                self.assertEqual(source.read_bytes(), before)
+                if prefix:
+                    self.assertEqual(result["original_submission"]["file"], declared)
+
+    def test_unsafe_relative_spellings_are_rejected(self):
+        from proposal_workspace import normalize_candidate_submission
+        with tempfile.TemporaryDirectory() as tmp:
+            _, code = self.layout(tmp)
+            for path in ("../agents/a.py", "text_classification/../agents/a.py",
+                         "/agents/a.py", "././agents/a.py", "other/agents/a.py",
+                         "agents/../a.py", "text_classification//agents/a.py"):
+                with self.subTest(path=path), self.assertRaises(ValueError):
+                    normalize_candidate_submission({"name": "a", "file": path}, code, 9)
